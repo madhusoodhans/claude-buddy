@@ -23,6 +23,18 @@ The device talks to one Mac at a time. To move it to another Mac, quit Claude
 Buddy on the first one (menu ✻ → Quit). The device then shows "Looking for
 your Mac" until the other one connects.
 
+## Updates
+
+Claude Buddy updates itself from this repo's GitHub releases:
+- **When it checks:** shortly after launch and every 6 hours. A ↑ next to the ✻ means an update is ready.
+- **To install:** choose **Update to Claude Buddy x.y…**, or **Check for Updates…** at any time.
+- **Before installing:** it checks the download's SHA-256 against the release's checksum file, plus the new app's bundle ID, version and code signature.
+- **Then:** it replaces itself in place and restarts. Your machines, settings and login item stay.
+
+This only works when the app is in a folder it can write to, like Applications. If you opened it straight from Downloads, macOS runs it from a temporary read-only copy. Move it to Applications first.
+
+macOS may ask for Bluetooth permission again after an update. The app is ad-hoc signed, so macOS treats each build as new.
+
 ## Claude on a remote machine
 
 If you run Claude Code on a dev box over SSH, add it from the menu: **Add

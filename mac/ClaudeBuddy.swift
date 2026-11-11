@@ -1229,6 +1229,145 @@ final class RemoteSource {
     }
 }
 
+// MARK: - Updating itself from GitHub releases
+
+/// Checks github.com/madhusoodhans/claude-buddy for a newer release and installs it in place:
+/// download the zip, check its SHA-256 against the release's .sha256 file, check the new app's
+/// bundle id, version and code signature, then swap it in after this app quits and relaunch it.
+final class Updater {
+    static let latestURL = URL(string: "https://api.github.com/repos/madhusoodhans/claude-buddy/releases/latest")!
+    static let assetName = "ClaudeBuddy-mac.zip"
+    let current = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "0"
+    var available: (version: String, zip: URL, sha: URL?)?
+    var state = ""  // shown in the menu while working, or the last problem
+    var busy = false
+    var onChange: (() -> Void)?
+
+    /// "1.10.0" > "1.9.2"; a leading "v" is ignored.
+    static func isNewer(_ a: String, than b: String) -> Bool {
+        let n = { (s: String) in s.trimmingCharacters(in: CharacterSet(charactersIn: "vV")).split(separator: ".").map { Int($0) ?? 0 } }
+        let x = n(a), y = n(b)
+        for i in 0..<max(x.count, y.count) {
+            let p = i < x.count ? x[i] : 0, q = i < y.count ? y[i] : 0
+            if p != q { return p > q }
+        }
+        return false
+    }
+
+    /// Where the running app lives, if it can be replaced there.
+    var installProblem: String? {
+        let path = Bundle.main.bundleURL.path
+        if !path.hasSuffix(".app") { return "Not running from an app bundle" }
+        if path.contains("/AppTranslocation/") { return "Move Claude Buddy to Applications first, then open it from there" }
+        if !FileManager.default.isWritableFile(atPath: Bundle.main.bundleURL.deletingLastPathComponent().path) {
+            return "Can't write to \(Bundle.main.bundleURL.deletingLastPathComponent().path)"
+        }
+        return nil
+    }
+
+    func check(done: ((Bool) -> Void)? = nil) {
+        var req = URLRequest(url: Updater.latestURL, timeoutInterval: 20)
+        req.setValue("application/vnd.github+json", forHTTPHeaderField: "Accept")
+        req.setValue("claude-buddy/\(current)", forHTTPHeaderField: "User-Agent")
+        URLSession.shared.dataTask(with: req) { data, resp, err in
+            DispatchQueue.main.async {
+                let code = (resp as? HTTPURLResponse)?.statusCode ?? 0
+                guard err == nil, code == 200, let data = data,
+                      let v = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                      let tag = v["tag_name"] as? String else {
+                    self.state = err != nil ? "Couldn't check for updates (offline?)" : "Couldn't check for updates (HTTP \(code))"
+                    log("update check: \(self.state)")
+                    self.onChange?()
+                    done?(false)
+                    return
+                }
+                let assets = v["assets"] as? [[String: Any]] ?? []
+                func asset(_ name: String) -> URL? {
+                    (assets.first { $0["name"] as? String == name }?["browser_download_url"] as? String).flatMap(URL.init(string:))
+                }
+                let version = tag.trimmingCharacters(in: CharacterSet(charactersIn: "vV"))
+                if Updater.isNewer(version, than: self.current), let zip = asset(Updater.assetName) {
+                    if self.available?.version != version { log("update available: \(version) (running \(self.current))") }
+                    self.available = (version, zip, asset(Updater.assetName + ".sha256"))
+                } else {
+                    self.available = nil
+                }
+                if !self.busy { self.state = "" }
+                self.onChange?()
+                done?(self.available != nil)
+            }
+        }.resume()
+    }
+
+    private func fail(_ why: String) {
+        busy = false
+        state = "Update failed: \(why)"
+        log(state)
+        onChange?()
+    }
+
+    /// Downloads, checks and stages the new app, then calls `quit`; a helper swaps the bundles once we've exited.
+    func install(relaunch: Bool = true, quit: @escaping () -> Void) {
+        guard let up = available, !busy else { return }
+        if let problem = installProblem { fail(problem); return }
+        busy = true
+        state = "Downloading \(up.version)…"
+        onChange?()
+        let appURL = Bundle.main.bundleURL
+        let stage = appURL.deletingLastPathComponent().appendingPathComponent(".claude-buddy-update-\(up.version)")
+        DispatchQueue.global().async {
+            func finish(_ why: String?) { DispatchQueue.main.async { if let w = why { self.fail(w) } } }
+            let fm = FileManager.default
+            try? fm.removeItem(at: stage)
+            do { try fm.createDirectory(at: stage, withIntermediateDirectories: true) } catch { return finish("can't stage the update: \(error.localizedDescription)") }
+            guard let zipData = try? Data(contentsOf: up.zip) else { return finish("download failed") }
+            if let shaURL = up.sha {
+                guard let shaText = try? String(contentsOf: shaURL, encoding: .utf8) else { return finish("couldn't download the checksum") }
+                let want = shaText.split(whereSeparator: { $0 == " " || $0.isNewline }).first.map(String.init)?.lowercased() ?? ""
+                let got = SHA256.hash(data: zipData).map { String(format: "%02x", $0) }.joined()
+                guard want == got else { return finish("checksum mismatch, download discarded") }
+            }
+            let zip = stage.appendingPathComponent(Updater.assetName)
+            do { try zipData.write(to: zip) } catch { return finish("can't save the download") }
+            DispatchQueue.main.async { self.state = "Installing \(up.version)…"; self.onChange?() }
+            let (unzipCode, _) = SSHKeys.run("/usr/bin/ditto", ["-x", "-k", zip.path, stage.path], timeout: 60)
+            let newApp = stage.appendingPathComponent("Claude Buddy.app")
+            guard unzipCode == 0, fm.fileExists(atPath: newApp.path) else { return finish("the download didn't contain the app") }
+            let info = NSDictionary(contentsOf: newApp.appendingPathComponent("Contents/Info.plist"))
+            guard info?["CFBundleIdentifier"] as? String == Bundle.main.bundleIdentifier else { return finish("the download is a different app") }
+            guard info?["CFBundleShortVersionString"] as? String == up.version else { return finish("the download's version doesn't match") }
+            let (signCode, signText) = SSHKeys.run("/usr/bin/codesign", ["--verify", "--deep", "--strict", newApp.path], timeout: 60)
+            guard signCode == 0 else { return finish("code signature check failed: \(ascii(signText, max: 60))") }
+            _ = SSHKeys.run("/usr/bin/xattr", ["-dr", "com.apple.quarantine", newApp.path], timeout: 20)
+
+            // Swap the bundles after we exit, putting the old one back if the move fails; then relaunch.
+            let q = { (s: String) in "'" + s.replacingOccurrences(of: "'", with: "'\\''") + "'" }
+            let old = appURL.path, backup = appURL.path + ".previous"
+            let script = """
+            #!/bin/sh
+            while kill -0 \(getpid()) 2>/dev/null; do sleep 0.2; done
+            rm -rf \(q(backup))
+            if mv \(q(old)) \(q(backup)) && mv \(q(newApp.path)) \(q(old)); then
+              rm -rf \(q(backup)) \(q(stage.path))
+            else
+              [ -d \(q(backup)) ] && [ ! -d \(q(old)) ] && mv \(q(backup)) \(q(old))
+            fi
+            \(relaunch ? "open \(q(old))" : "")
+            """
+            let scriptURL = stage.appendingPathComponent("swap.sh")
+            do { try script.write(to: scriptURL, atomically: true, encoding: .utf8) } catch { return finish("can't write the installer") }
+            let p = Process()
+            p.executableURL = URL(fileURLWithPath: "/bin/sh")
+            p.arguments = [scriptURL.path]
+            p.standardOutput = FileHandle.nullDevice
+            p.standardError = FileHandle.nullDevice
+            do { try p.run() } catch { return finish("can't start the installer") }
+            log("installing update \(up.version); restarting")
+            DispatchQueue.main.async { quit() }
+        }
+    }
+}
+
 // MARK: - The app
 
 final class AppDelegate: NSObject, NSApplicationDelegate {
@@ -1238,6 +1377,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     var link: DeviceLink!
     var item: NSStatusItem!
     var remotes: [RemoteSource] = []
+    let updater = Updater()
     var lastStatus = "", lastToday = ""
     var usageSource = "This Mac"
     var timers: [Timer] = []
@@ -1275,6 +1415,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         every(3) { [weak self] in self?.scanToday() }
         every(10) { [weak self] in self?.sendAll(includeFeed: false) }
         every(60) { [weak self] in self?.usage.poll() }
+        updater.onChange = { [weak self] in self?.menuDirty = true }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 20) { [weak self] in self?.updater.check() }
+        every(6 * 3600) { [weak self] in self?.updater.check() }
         every(1) { [weak self] in
             if self?.menuDirty == true { self?.menuDirty = false; self?.refreshMenu() }
         }
@@ -1468,7 +1611,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         guard let button = item?.button else { return }
         let mood = Int(fields(pooledStatus())[1]) ?? 0
         let colors: [NSColor] = [.secondaryLabelColor, NSColor(red: 0.85, green: 0.47, blue: 0.34, alpha: 1), .systemOrange, .systemGreen]
-        button.attributedTitle = NSAttributedString(string: "✻", attributes: [
+        button.attributedTitle = NSAttributedString(string: updater.available != nil ? "✻↑" : "✻", attributes: [
             .foregroundColor: link.connected ? colors[min(3, mood)] : NSColor.tertiaryLabelColor,
             .font: NSFont.systemFont(ofSize: 15, weight: .bold)])
         button.toolTip = "Claude Buddy"
@@ -1487,6 +1630,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             return i
         }
 
+        if let up = updater.available, !updater.busy {
+            let u = action("Update to Claude Buddy \(up.version)…", #selector(installUpdate))
+            u.attributedTitle = NSAttributedString(string: u.title, attributes: [.font: NSFont.boldSystemFont(ofSize: NSFont.systemFontSize)])
+            menu.addItem(.separator())
+        }
+        if !updater.state.isEmpty { info(updater.state); menu.addItem(.separator()) }
         info("Device: \(link.status)")
         info(moodText())
         info(usageText())
@@ -1560,6 +1709,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             login.state = SMAppService.mainApp.status == .enabled ? .on : .off
         }
         _ = action("Refresh Usage Now", #selector(refreshUsage), key: "r")
+        _ = action("Check for Updates…  (\(updater.current))", #selector(checkForUpdates))
         _ = action("Show Log", #selector(openLog))
         menu.addItem(.separator())
         menu.addItem(NSMenuItem(title: "Quit Claude Buddy", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q"))
@@ -1634,6 +1784,32 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     @objc func refreshUsage() { usage.poll(force: true) }
+
+    @objc func checkForUpdates() {
+        updater.state = "Checking for updates…"
+        refreshMenu()
+        updater.check { [weak self] found in
+            guard let self = self else { return }
+            let alert = NSAlert()
+            if found, let up = self.updater.available {
+                alert.messageText = "Claude Buddy \(up.version) is available"
+                alert.informativeText = "You have \(self.updater.current). Install it now? Claude Buddy restarts by itself; your machines and settings stay."
+                alert.addButton(withTitle: "Install")
+                alert.addButton(withTitle: "Later")
+                NSApp.activate(ignoringOtherApps: true)
+                if alert.runModal() == .alertFirstButtonReturn { self.installUpdate() }
+            } else if self.updater.state.isEmpty {
+                alert.messageText = "Claude Buddy is up to date"
+                alert.informativeText = "You have the latest version, \(self.updater.current)."
+                NSApp.activate(ignoringOtherApps: true)
+                alert.runModal()
+            }
+        }
+    }
+
+    @objc func installUpdate() {
+        updater.install { NSApp.terminate(nil) }
+    }
     @objc func openLog() { NSWorkspace.shared.open(logURL) }
 }
 
@@ -1660,6 +1836,20 @@ if ProcessInfo.processInfo.environment["CLAUDE_BUDDY_ASKPASS"] == "1" {
         exit(0)
     }
     exit(1)
+}
+
+// `ClaudeBuddy --install-update` checks and installs the latest release into this bundle without
+// relaunching (for testing the updater).
+if CommandLine.arguments.contains("--install-update") {
+    let u = Updater()
+    print("running \(u.current)")
+    u.onChange = { if !u.state.isEmpty { print(u.state) } }
+    u.check { found in
+        guard found, let up = u.available else { print("no newer release"); exit(0) }
+        print("installing \(up.version)")
+        u.install(relaunch: false) { exit(0) }
+    }
+    RunLoop.main.run()
 }
 
 // `ClaudeBuddy --unlock-key <host>` runs the same unlock as the menu (for testing).
