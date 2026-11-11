@@ -14,10 +14,16 @@ on the remote and runs it with `python3`. Nothing needs installing there.
 
 ## What the remote needs
 
-- **SSH login with a key, without a password prompt.** The app uses
-  `BatchMode`, so it can't answer prompts. If your key has a passphrase, add
-  it to the agent once (`ssh-add --apple-use-keychain ~/.ssh/id_ed25519`). If
-  `ssh <host>` works in Terminal without typing anything, the app works too.
+- **SSH login with a key.** A key with a passphrase is fine:
+  - **When it asks:** right after you add the machine, the app asks for the
+    passphrase in a Mac dialog. Later, use **Unlock SSH Key…** in the
+    machine's menu.
+  - **What happens to it:** the key is unlocked in your Mac's SSH agent, and
+    the passphrase is saved in your login Keychain. It's the same as running
+    `ssh-add --apple-use-keychain` in Terminal, and it's how the app
+    reconnects after sleep or a restart without asking again.
+  - **Password logins** (no key) aren't supported, since the app can't type a
+    password at every reconnect.
 - **python3**, version 3.6 or later. Most Linux systems have it.
 - **Claude Code signed in there**, for the usage page. The menu shows which
   account it found under the machine (claude.ai Enterprise/Team/Pro, API key,

@@ -964,6 +964,65 @@ func sshConfigHosts() -> [String] {
     return hosts
 }
 
+/// Passphrase-protected SSH keys. The app connects with BatchMode (it can't answer prompts), so a
+/// locked key is unlocked into the Mac's ssh-agent with the passphrase saved in the login Keychain,
+/// exactly like `ssh-add --apple-use-keychain`. The passphrase dialog is this app itself, run by
+/// ssh-add as its SSH_ASKPASS helper (see askpass() at the bottom).
+enum SSHKeys {
+    static func run(_ path: String, _ args: [String], env extra: [String: String] = [:], timeout: TimeInterval = 120) -> (Int32, String) {
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: path)
+        p.arguments = args
+        var env = ProcessInfo.processInfo.environment
+        extra.forEach { env[$0.key] = $0.value }
+        p.environment = env
+        let out = Pipe()
+        p.standardOutput = out
+        p.standardError = out
+        p.standardInput = FileHandle.nullDevice
+        guard (try? p.run()) != nil else { return (-1, "") }
+        let deadline = Date().addingTimeInterval(timeout)
+        while p.isRunning && Date() < deadline { usleep(50_000) }
+        if p.isRunning { p.terminate() }
+        let text = String(data: out.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
+        return (p.terminationStatus, text)
+    }
+
+    /// Loads keys whose passphrases are already in the Keychain (no prompt). After a restart the agent is empty.
+    static func loadFromKeychain() {
+        _ = run("/usr/bin/ssh-add", ["--apple-load-keychain"], timeout: 10)
+    }
+
+    /// The key files ssh would offer to this host (from ~/.ssh/config, or the defaults), that exist.
+    static func identityFiles(_ host: String) -> [String] {
+        let testConfig = ProcessInfo.processInfo.environment["CLAUDE_BUDDY_SSH_CONFIG"].map { ["-F", $0] } ?? []  // tests only
+        let (_, text) = run("/usr/bin/ssh", testConfig + ["-G", host], timeout: 10)
+        var files: [String] = []
+        for line in text.components(separatedBy: .newlines) where line.lowercased().hasPrefix("identityfile ") {
+            let f = (String(line.dropFirst("identityfile ".count)) as NSString).expandingTildeInPath
+            if FileManager.default.fileExists(atPath: f) && !files.contains(f) { files.append(f) }
+        }
+        return files
+    }
+
+    /// Asks for each key's passphrase and adds it to the agent + Keychain. Calls back on the main queue.
+    static func unlock(host: String, done: @escaping (Bool, String) -> Void) {
+        DispatchQueue.global().async {
+            let files = identityFiles(host)
+            var ok = false, message = files.isEmpty ? "No SSH key found for \(host)" : ""
+            for f in files {
+                let (code, text) = run("/usr/bin/ssh-add", ["--apple-use-keychain", f], env: [
+                    "SSH_ASKPASS": Bundle.main.executablePath ?? "", "SSH_ASKPASS_REQUIRE": "force",
+                    "DISPLAY": ":0", "CLAUDE_BUDDY_ASKPASS": "1"])
+                if code == 0 { ok = true; message = "Unlocked \((f as NSString).lastPathComponent)" }
+                else if message.isEmpty { message = ascii(text.trimmingCharacters(in: .whitespacesAndNewlines), max: 80) }
+            }
+            log("ssh key unlock for \(host): \(ok ? "ok" : "failed") \(message)")
+            DispatchQueue.main.async { done(ok, message) }
+        }
+    }
+}
+
 /// One machine where Claude Code runs, followed over SSH. The app sends ../remote/buddy-agent.py
 /// with every connect (so it always matches the app) and reads the agent's protocol lines back.
 final class RemoteSource {
@@ -980,6 +1039,11 @@ final class RemoteSource {
     var note = ""
     var onFeed: ((String) -> Void)?
     var onChange: (() -> Void)?
+    /// The login failed because the SSH key is locked: the menu offers Unlock SSH Key.
+    var needsUnlock = false
+    var onNeedsUnlock: ((RemoteSource) -> Void)?
+    var unlockedOnce = false
+    private var triedKeychain = false
 
     private var process: Process?
     private var stdin: Pipe?
@@ -1100,6 +1164,8 @@ final class RemoteSource {
         guard let kind = f.first else { return }
         if !connected && kind != "E" {
             connected = true
+            needsUnlock = false
+            triedKeychain = false
             retry = 5
             state = "Connected"
             log("\(host): connected")
@@ -1130,11 +1196,29 @@ final class RemoteSource {
         if stopped { return }
         let e = errorText
         if note.hasPrefix("python3 is not installed") { state = "python3 isn't installed there" }
-        else if e.contains("Permission denied") { state = "SSH login failed: needs a key (no password prompts here)" }
+        else if e.contains("Permission denied") && testHome == nil {
+            if !triedKeychain {  // after a restart the agent is empty, but the passphrase may be saved
+                triedKeychain = true
+                state = "Unlocking SSH key"
+                DispatchQueue.global().async { [weak self] in
+                    SSHKeys.loadFromKeychain()
+                    DispatchQueue.main.async { self?.start() }
+                }
+                onChange?()
+                return
+            }
+            if unlockedOnce {
+                state = "SSH login refused: is this key allowed on \(host)?"
+            } else {
+                state = "SSH key is locked: choose Unlock SSH Key"
+                needsUnlock = true
+                onNeedsUnlock?(self)
+            }
+        }
         else if e.contains("Could not resolve hostname") { state = "Unknown host" }
         else if e.contains("timed out") || e.contains("No route") || e.contains("Network is unreachable") { state = "Can't reach it (VPN?)" }
         else if e.contains("Host key verification failed") { state = "Host key not trusted yet: ssh to it once in Terminal" }
-        else if e.contains("passphrase") { state = "SSH key needs its passphrase: add it with ssh-add" }
+        else if e.contains("passphrase") { state = "SSH key is locked: choose Unlock SSH Key"; needsUnlock = true; onNeedsUnlock?(self) }
         else if !e.isEmpty { state = ascii(e, max: 70) }
         else { state = "Disconnected" }
         log("\(host): ended (\(code)) \(e)")
@@ -1158,6 +1242,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     var usageSource = "This Mac"
     var timers: [Timer] = []
     private var menuDirty = false
+    private var justAdded: [String: Date] = [:]  // hosts added from the menu: ask for the key right away
+    private var unlocking = Set<String>()
 
     func applicationDidFinishLaunching(_ n: Notification) {
         try? FileManager.default.createDirectory(at: buddyDir, withIntermediateDirectories: true)
@@ -1213,7 +1299,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let r = RemoteSource(host: host, testHome: testHome)
         r.onFeed = { [weak self] line in self?.link.send(line) }
         r.onChange = { [weak self] in self?.menuDirty = true }
+        r.onNeedsUnlock = { [weak self] r in
+            guard let self = self, let added = self.justAdded[r.host], Date().timeIntervalSince(added) < 180 else { return }
+            self.justAdded[r.host] = nil
+            self.unlockKey(r.host)
+        }
         remotes.append(r)
+        if save { justAdded[host] = Date() }
         if save {
             var list = Config.remotes
             list.append(["host": host])
@@ -1428,6 +1520,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             let it = NSMenuItem(title: "\(r.connected ? "●" : "○")  \(r.host) — \(word)", action: nil, keyEquivalent: "")
             let sub = NSMenu()
             info(r.connected ? "Connected over SSH" : r.state, to: sub)
+            if r.needsUnlock && !unlocking.contains(r.host) {
+                _ = action("Unlock SSH Key…", #selector(unlockKeyItem(_:)), r.host, to: sub)
+            }
             if !r.account.isEmpty { info("Account: \(r.account)", to: sub) }
             if let u = r.usage, u.hasPrefix("U|1|") {
                 let meters = fields(u).dropFirst(5).compactMap { m -> String? in
@@ -1498,6 +1593,28 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
+    @objc func unlockKeyItem(_ sender: NSMenuItem) {
+        if let h = sender.representedObject as? String { unlockKey(h) }
+    }
+
+    func unlockKey(_ host: String) {
+        guard !unlocking.contains(host), let r = remotes.first(where: { $0.host == host }) else { return }
+        unlocking.insert(host)
+        r.state = "Waiting for your SSH key passphrase"
+        refreshMenu()
+        SSHKeys.unlock(host: host) { [weak self] ok, message in
+            self?.unlocking.remove(host)
+            if ok {
+                r.unlockedOnce = true
+                r.needsUnlock = false
+                r.reconnect()
+            } else {
+                r.state = "Still locked: " + message
+            }
+            self?.refreshMenu()
+        }
+    }
+
     @objc func reconnectRemote(_ sender: NSMenuItem) {
         if let h = sender.representedObject as? String { remotes.first { $0.host == h }?.reconnect() }
     }
@@ -1518,6 +1635,39 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     @objc func refreshUsage() { usage.poll(force: true) }
     @objc func openLog() { NSWorkspace.shared.open(logURL) }
+}
+
+// Run by ssh-add as SSH_ASKPASS (CLAUDE_BUDDY_ASKPASS=1): ask for a key's passphrase in a dialog,
+// print it for ssh-add, and exit. Cancel exits 1, which ssh-add takes as "no".
+if ProcessInfo.processInfo.environment["CLAUDE_BUDDY_ASKPASS"] == "1" {
+    let prompt = CommandLine.arguments.dropFirst().joined(separator: " ")
+    if let test = ProcessInfo.processInfo.environment["CLAUDE_BUDDY_ASKPASS_TEST"] { print(test); exit(0) }  // tests only
+    let askApp = NSApplication.shared
+    askApp.setActivationPolicy(.accessory)
+    let alert = NSAlert()
+    alert.messageText = "Unlock your SSH key for Claude Buddy"
+    alert.informativeText = (prompt.isEmpty ? "Enter the passphrase for your SSH key." : prompt)
+        + "\n\nIt's added to your Mac's SSH agent and saved in your login Keychain (like ssh-add --apple-use-keychain), so Claude Buddy can reconnect without asking again."
+    let field = NSSecureTextField(frame: NSRect(x: 0, y: 0, width: 280, height: 24))
+    alert.accessoryView = field
+    alert.addButton(withTitle: "Unlock")
+    alert.addButton(withTitle: "Cancel")
+    askApp.activate(ignoringOtherApps: true)
+    alert.window.initialFirstResponder = field
+    let answer = alert.runModal()
+    if answer == .alertFirstButtonReturn {
+        print(field.stringValue)
+        exit(0)
+    }
+    exit(1)
+}
+
+// `ClaudeBuddy --unlock-key <host>` runs the same unlock as the menu (for testing).
+if let i = CommandLine.arguments.firstIndex(of: "--unlock-key"), i + 1 < CommandLine.arguments.count {
+    let host = CommandLine.arguments[i + 1]
+    print("identity files: \(SSHKeys.identityFiles(host))")
+    SSHKeys.unlock(host: host) { ok, message in print(ok ? "unlocked: \(message)" : "failed: \(message)"); exit(ok ? 0 : 1) }
+    RunLoop.main.run()
 }
 
 // `ClaudeBuddy --parse-usage answer.json [ISO-time]` prints the device's usage line for a
