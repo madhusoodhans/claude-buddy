@@ -10,7 +10,8 @@ clang++ -std=c++17 -O1 -Iinc -I$B -include cmath sim.cpp $B/face.cpp $B/meters.c
 (cd out && ./sim)
 ../../.venv/bin/python - <<'PY'
 from PIL import Image
-names = ["face_working", "face_waiting", "face_done", "face_idle", "face_lost", "meters", "day"]
+names = ["face_working", "face_waiting", "face_done", "face_idle", "face_lost", "meters", "day",
+         "meters_weekly", "meters_spend", "meters_none"]
 ims = [Image.open(f"out/{n}.ppm") for n in names]
 sheet = Image.new("RGB", (len(ims) * 250, 300), (255, 255, 255))
 for i, im in enumerate(ims):

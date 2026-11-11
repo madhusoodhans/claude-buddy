@@ -1,0 +1,1 @@
+{"five_hour":null,"seven_day":{"utilization":48.0,"resets_at":"2026-11-07T01:59:59.879601+00:00"},"extra_usage":{"is_enabled":false,"monthly_limit":null,"utilization":null},"limits":[{"kind":"weekly_all","group":"weekly","percent":48,"resets_at":"2026-11-07T01:59:59.879601+00:00","is_active":true}]}

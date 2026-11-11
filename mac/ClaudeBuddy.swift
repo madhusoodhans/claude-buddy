@@ -12,16 +12,64 @@
 
 import AppKit
 import CoreBluetooth
+import CryptoKit
 import ServiceManagement
 
 // MARK: - Paths and helpers
 
 let home = FileManager.default.homeDirectoryForCurrentUser
 let buddyDir = home.appendingPathComponent(".claude-buddy")
-let claudeDir = ProcessInfo.processInfo.environment["CLAUDE_CONFIG_DIR"].map { URL(fileURLWithPath: $0) }
-    ?? home.appendingPathComponent(".claude")
 let eventsURL = buddyDir.appendingPathComponent("events.log")
 let logURL = buddyDir.appendingPathComponent("buddy.log")
+let defaultClaudeDir = home.appendingPathComponent(".claude")
+
+/// Every Claude Code config folder on this Mac: ~/.claude, plus CLAUDE_CONFIG_DIR
+/// (from this process, or from the login shell when started from Finder), plus
+/// any listed in ~/.claude-buddy/config.json as {"claudeConfigDirs": [...]}.
+let claudeDirs: [URL] = {
+    var paths: [String] = []
+    if let env = ProcessInfo.processInfo.environment["CLAUDE_CONFIG_DIR"] { paths.append(env) }
+    if let shell = loginShellValue("CLAUDE_CONFIG_DIR") { paths.append(shell) }
+    if let data = try? Data(contentsOf: buddyDir.appendingPathComponent("config.json")),
+       let o = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
+        paths += o["claudeConfigDirs"] as? [String] ?? []
+    }
+    var dirs = [defaultClaudeDir]
+    for p in paths where !p.isEmpty {
+        let expanded = (p as NSString).expandingTildeInPath
+        let trimmed = expanded.count > 1 && expanded.hasSuffix("/") ? String(expanded.dropLast()) : expanded
+        let url = URL(fileURLWithPath: trimmed)
+        if !dirs.contains(where: { $0.path == url.path }) { dirs.append(url) }
+    }
+    return dirs
+}()
+
+/// A variable as the user's login shell sets it (apps opened from Finder don't inherit shell setup).
+func loginShellValue(_ name: String) -> String? {
+    let p = Process()
+    p.executableURL = URL(fileURLWithPath: ProcessInfo.processInfo.environment["SHELL"] ?? "/bin/zsh")
+    p.arguments = ["-lic", "printf '\\n__claude_buddy__%s\\n' \"$\(name)\""]
+    let out = Pipe()
+    p.standardOutput = out
+    p.standardError = FileHandle.nullDevice
+    p.standardInput = FileHandle.nullDevice
+    guard (try? p.run()) != nil else { return nil }
+    let deadline = Date().addingTimeInterval(4)
+    while p.isRunning && Date() < deadline { usleep(50_000) }
+    if p.isRunning { p.terminate(); return nil }
+    let text = String(data: out.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
+    let line = text.components(separatedBy: "\n").last { $0.hasPrefix("__claude_buddy__") }
+    let value = line.map { String($0.dropFirst("__claude_buddy__".count)) } ?? ""
+    return value.isEmpty ? nil : value
+}
+
+/// Claude Code's Keychain item for a config folder: "Claude Code-credentials" for ~/.claude,
+/// otherwise suffixed with the first 8 hex digits of the SHA-256 of the folder path.
+func keychainService(for dir: URL) -> String {
+    if dir.path == defaultClaudeDir.path { return "Claude Code-credentials" }
+    let hash = SHA256.hash(data: Data(dir.path.precomposedStringWithCanonicalMapping.utf8))
+    return "Claude Code-credentials-" + hash.prefix(4).map { String(format: "%02x", $0) }.joined()
+}
 
 func log(_ s: String) {
     let line = "\(ISO8601DateFormatter().string(from: Date())) \(s)\n"
@@ -71,7 +119,7 @@ enum Hooks {
     static let toolEvents = ["PreToolUse", "PostToolUse"]
     static let events = ["SessionStart", "SessionEnd", "UserPromptSubmit", "PreToolUse", "PostToolUse",
                          "Notification", "Stop"]
-    static var settingsURL: URL { claudeDir.appendingPathComponent("settings.json") }
+    static let managedSettings = URL(fileURLWithPath: "/Library/Application Support/ClaudeCode/managed-settings.json")
 
     static let scriptText = """
     #!/bin/sh
@@ -85,15 +133,28 @@ enum Hooks {
 
     """
 
-    static func loadSettings() throws -> [String: Any] {
-        guard FileManager.default.fileExists(atPath: settingsURL.path) else { return [:] }
-        let data = try Data(contentsOf: settingsURL)
+    static func settingsURL(_ dir: URL) -> URL { dir.appendingPathComponent("settings.json") }
+
+    static func loadJSON(_ url: URL) throws -> [String: Any] {
+        guard FileManager.default.fileExists(atPath: url.path) else { return [:] }
+        let data = try Data(contentsOf: url)
         if data.isEmpty { return [:] }
         guard let root = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
-            throw NSError(domain: "ClaudeBuddy", code: 1,
-                          userInfo: [NSLocalizedDescriptionKey: "\(settingsURL.path) isn't a JSON object"])
+            throw NSError(domain: "ClaudeBuddy", code: 1, userInfo: [NSLocalizedDescriptionKey: "\(url.path) isn't a JSON object"])
         }
         return root
+    }
+
+    /// Why Claude Code won't run our hooks, if a setting says so (company policy or the user's own).
+    static var blockedBySettings: String? {
+        if let m = try? loadJSON(managedSettings) {
+            if m["allowManagedHooksOnly"] as? Bool == true { return "Your organisation only allows its own hooks" }
+            if m["disableAllHooks"] as? Bool == true { return "Your organisation turned hooks off" }
+        }
+        for dir in claudeDirs {
+            if (try? loadJSON(settingsURL(dir)))?["disableAllHooks"] as? Bool == true { return "Hooks are turned off in Claude Code settings" }
+        }
+        return nil
     }
 
     static func ours(_ entry: Any) -> Bool {
@@ -101,51 +162,58 @@ enum Hooks {
         return hooks.contains { ($0["command"] as? String)?.contains(marker) == true }
     }
 
-    static var installed: Bool {
-        guard let root = try? loadSettings(), let hooks = root["hooks"] as? [String: Any] else { return false }
+    static func installed(in dir: URL) -> Bool {
+        guard let root = try? loadJSON(settingsURL(dir)), let hooks = root["hooks"] as? [String: Any] else { return false }
         return events.allSatisfy { ev in (hooks[ev] as? [Any])?.contains(where: ours) == true }
-            && FileManager.default.fileExists(atPath: script.path)
     }
 
-    static func save(_ root: [String: Any]) throws {
-        try FileManager.default.createDirectory(at: claudeDir, withIntermediateDirectories: true)
-        let backup = claudeDir.appendingPathComponent("settings.json.before-claude-buddy")
-        if FileManager.default.fileExists(atPath: settingsURL.path),
-           !FileManager.default.fileExists(atPath: backup.path) {
-            try FileManager.default.copyItem(at: settingsURL, to: backup)
+    static var installed: Bool {
+        FileManager.default.fileExists(atPath: script.path) && claudeDirs.allSatisfy(installed(in:))
+    }
+
+    static func save(_ root: [String: Any], in dir: URL) throws {
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        let url = settingsURL(dir)
+        let backup = dir.appendingPathComponent("settings.json.before-claude-buddy")
+        if FileManager.default.fileExists(atPath: url.path), !FileManager.default.fileExists(atPath: backup.path) {
+            try FileManager.default.copyItem(at: url, to: backup)
         }
         let data = try JSONSerialization.data(withJSONObject: root, options: [.prettyPrinted, .withoutEscapingSlashes])
-        try data.write(to: settingsURL, options: .atomic)
+        try data.write(to: url, options: .atomic)
     }
 
-    /// Adds our hook to each event, keeping everything else in settings.json as it was.
+    /// Adds our hook to each event in every config folder, keeping everything else in settings.json as it was.
     static func install() throws {
         try scriptText.write(to: script, atomically: true, encoding: .utf8)
         try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: script.path)
-        var root = try loadSettings()
-        var hooks = root["hooks"] as? [String: Any] ?? [:]
-        for ev in events {
-            var list = (hooks[ev] as? [Any] ?? []).filter { !ours($0) }
-            var entry: [String: Any] = ["hooks": [["type": "command", "command": command, "timeout": 5]]]
-            if toolEvents.contains(ev) { entry["matcher"] = "*" }
-            list.append(entry)
-            hooks[ev] = list
+        for dir in claudeDirs where !installed(in: dir) {
+            var root = try loadJSON(settingsURL(dir))
+            var hooks = root["hooks"] as? [String: Any] ?? [:]
+            for ev in events {
+                var list = (hooks[ev] as? [Any] ?? []).filter { !ours($0) }
+                var entry: [String: Any] = ["hooks": [["type": "command", "command": command, "timeout": 5]]]
+                if toolEvents.contains(ev) { entry["matcher"] = "*" }
+                list.append(entry)
+                hooks[ev] = list
+            }
+            root["hooks"] = hooks
+            try save(root, in: dir)
+            log("installed Claude Code hooks in \(settingsURL(dir).path)")
         }
-        root["hooks"] = hooks
-        try save(root)
-        log("installed Claude Code hooks in \(settingsURL.path)")
     }
 
     static func uninstall() throws {
-        var root = try loadSettings()
-        guard var hooks = root["hooks"] as? [String: Any] else { return }
-        for (ev, value) in hooks {
-            let list = (value as? [Any] ?? []).filter { !ours($0) }
-            if list.isEmpty { hooks[ev] = nil } else { hooks[ev] = list }
+        for dir in claudeDirs {
+            var root = try loadJSON(settingsURL(dir))
+            guard var hooks = root["hooks"] as? [String: Any] else { continue }
+            for (ev, value) in hooks {
+                let list = (value as? [Any] ?? []).filter { !ours($0) }
+                if list.isEmpty { hooks[ev] = nil } else { hooks[ev] = list }
+            }
+            root["hooks"] = hooks.isEmpty ? nil : hooks
+            try save(root, in: dir)
+            log("removed Claude Code hooks from \(settingsURL(dir).path)")
         }
-        root["hooks"] = hooks.isEmpty ? nil : hooks
-        try save(root)
-        log("removed Claude Code hooks")
     }
 }
 
@@ -282,13 +350,45 @@ final class Tracker {
             if s.mood == .working && quiet > 15 * 60 { set(s, .idle, "") }  // missed the end of the turn
             if s.mood == .waiting && quiet > 30 * 60 { set(s, .idle, "") }
         }
+        // Sessions we only know from their transcripts: no "waiting" (that needs hooks).
+        var all = Array(sessions.values)
+        hooklessActive = 0
+        for (id, l) in live where sessions[id] == nil {
+            let s = Session(id)
+            s.project = l.project
+            s.last = l.last
+            if l.working && now.timeIntervalSince(l.last) < 10 * 60 {
+                s.mood = .working
+                s.detail = l.detail
+                s.turnStart = l.turnStart
+                s.since = l.turnStart ?? l.last
+                hooklessActive += 1
+            } else if let end = l.endedAt, now.timeIntervalSince(end) < 90 {
+                s.mood = .done
+                s.since = end
+                s.detail = l.turnStart.map { "Finished in " + duration(end.timeIntervalSince($0)) } ?? "Finished"
+            } else {
+                s.since = l.endedAt ?? l.last
+            }
+            all.append(s)
+        }
+        if hooklessActive != lastHooklessActive {
+            log("sessions working without hook events (followed through their transcripts): \(hooklessActive)")
+            lastHooklessActive = hooklessActive
+        }
         let rank: [Mood: Int] = [.waiting: 3, .working: 2, .done: 1, .idle: 0]
-        guard let top = sessions.values.max(by: { (rank[$0.mood]!, $0.last) < (rank[$1.mood]!, $1.last) }) else {
+        guard let top = all.max(by: { (rank[$0.mood]!, $0.last) < (rank[$1.mood]!, $1.last) }) else {
             return "S|0|0|0||"
         }
         let start = top.mood == .working ? (top.turnStart ?? top.since) : top.since
-        return "S|\(top.mood.rawValue)|\(Int(now.timeIntervalSince(start)))|\(sessions.count)|\(top.project)|\(top.detail)"
+        return "S|\(top.mood.rawValue)|\(Int(now.timeIntervalSince(start)))|\(all.count)|\(top.project)|\(top.detail)"
     }
+
+    /// Transcript-only sessions, refreshed by the app from TodayScanner.
+    var live: [String: LiveSession] = [:]
+    /// How many sessions are working without sending hook events (for the menu's hint).
+    private(set) var hooklessActive = 0
+    private var lastHooklessActive = 0
 
     /// Hands over what the hook script appended since last time.
     func drainEvents() {
@@ -309,40 +409,145 @@ final class Tracker {
 
 // MARK: - Plan usage
 
+/// One bar on the device's usage page.
+struct Meter {
+    var label: String
+    var pct: Int
+    var start: Date?   // when the window began, for the pace marker
+    var reset: Date?   // nil = not started
+    var dated = false  // show the reset as a date ("Resets Dec 1") instead of a countdown
+}
+
+/// What the usage endpoint's answer means for the device. Account shapes, after Clawdmeter:
+///  * Pro / Max / Team: a 5-hour window and a weekly one
+///  * weekly only (e.g. top Max tiers): "five_hour": null next to "seven_day"
+///  * spend-capped Enterprise: a spend limit in "limits", or only in the top-level
+///    "spend" / "extra_usage" objects, with every window null
+enum UsageParse {
+    static func date(_ any: Any?) -> Date? {
+        guard let s = any as? String else { return nil }
+        let f = ISO8601DateFormatter()
+        f.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        return f.date(from: s) ?? ISO8601DateFormatter().date(from: s)
+    }
+
+    static func number(_ any: Any?) -> Double? { (any as? NSNumber)?.doubleValue }
+
+    static func firstOfNextMonthUTC(_ now: Date) -> Date {
+        var cal = Calendar(identifier: .gregorian)
+        cal.timeZone = TimeZone(identifier: "UTC")!
+        let start = cal.date(from: cal.dateComponents([.year, .month], from: now))!
+        return cal.date(byAdding: .month, value: 1, to: start)!
+    }
+
+    static func spendMeter(group: String?, pct: Int, reset: Date?, now: Date) -> Meter {
+        var cal = Calendar(identifier: .gregorian)
+        cal.timeZone = TimeZone(identifier: "UTC")!
+        let (label, unit): (String, Calendar.Component) = {
+            switch group {
+            case "daily": return ("Daily spend", .day)
+            case "weekly": return ("Weekly spend", .weekOfYear)
+            default: return ("Monthly spend", .month)
+            }
+        }()
+        let r = reset ?? firstOfNextMonthUTC(now)
+        return Meter(label: label, pct: pct, start: cal.date(byAdding: unit, value: -1, to: r), reset: r, dated: unit != .day)
+    }
+
+    /// The meters to show (at most two) and a line explaining anything unusual, or nil if there's nothing to show.
+    static func meters(_ v: [String: Any], now: Date) -> (meters: [Meter], note: String)? {
+        func window(_ key: String, label: String, length: TimeInterval) -> Meter? {
+            guard let w = v[key] as? [String: Any] else { return nil }
+            let pct = Int((number(w["utilization"]) ?? 0).rounded())
+            guard let reset = date(w["resets_at"]), reset > now else {
+                return Meter(label: label, pct: 0, start: nil, reset: nil)  // the window hasn't started
+            }
+            return Meter(label: label, pct: pct, start: reset.addingTimeInterval(-length), reset: reset)
+        }
+        let session = window("five_hour", label: "Session  5h", length: 5 * 3600)
+        let week = window("seven_day", label: "Weekly", length: 7 * 86400)
+
+        var spend: Meter?
+        let limits = v["limits"] as? [[String: Any]] ?? []
+        if let l = limits.first(where: { $0["kind"] as? String == "spend" }), let pct = number(l["percent"]) {
+            spend = spendMeter(group: l["group"] as? String, pct: Int(pct.rounded()), reset: date(l["resets_at"]), now: now)
+        } else if session == nil && week == nil {
+            // Spend cap only in the top-level objects: it counts only with a cap to measure against.
+            let extra = (v["extra_usage"] as? [String: Any]).flatMap { $0["is_enabled"] as? Bool == true ? $0 : nil }
+            let top = (v["spend"] as? [String: Any]).flatMap { $0["enabled"] as? Bool == false ? nil : $0 }
+            let capped = !(extra?["monthly_limit"] is NSNull || extra?["monthly_limit"] == nil)
+                || !(top?["limit"] is NSNull || top?["limit"] == nil)
+            if capped, var pct = number(top?["percent"]) ?? number(extra?["utilization"]) {
+                if extra?["spend_limit_reached"] as? Bool == true { pct = max(pct, 100) }
+                spend = spendMeter(group: "monthly", pct: Int(min(9999, pct.rounded())), reset: nil, now: now)
+            }
+        }
+
+        var shown = [session, week, spend].compactMap { $0 }
+        if shown.count > 2 { shown = [spend!, week!] }  // a cap on a subscription: the cap matters most
+        if shown.isEmpty { return nil }
+        var note = ""
+        if session == nil && week != nil && v["five_hour"] is NSNull { note = "No 5-hour limit on this plan" }
+        else if spend != nil && week == nil && session == nil { note = "Spend limit set by your organisation" }
+        return (shown, note)
+    }
+}
+
 final class UsagePoller {
-    var message = "U|0|0|-1|0|-1||0|Asking Claude for usage"
+    var message = "U|0|0||Asking Claude for usage"
     var summary = "Usage: waiting"
     private var fetchedAt: Date?
-    private var reading: (s: Int, sr: Date?, w: Int, wr: Date?, plan: String)?
+    private var reading: (meters: [Meter], note: String, plan: String)?
     private var note = ""
     private var nextAllowed = Date.distantPast
     private var inFlight = false
     var onChange: (() -> Void)?
+    /// Config folders in the order to try their sign-in (the most recently used first).
+    var preferredDirs: () -> [URL] = { claudeDirs }
 
     struct Token { let access: String; let expires: Date?; let plan: String }
 
-    static func readToken() -> Token? {
-        var blobs: [String] = []
+    static func keychainBlob(_ service: String) -> String? {
         let p = Process()
         p.executableURL = URL(fileURLWithPath: "/usr/bin/security")
-        p.arguments = ["find-generic-password", "-s", "Claude Code-credentials", "-w"]
+        p.arguments = ["find-generic-password", "-s", service, "-w"]
         let out = Pipe()
         p.standardOutput = out
-        p.standardError = Pipe()
-        if (try? p.run()) != nil {
-            let data = out.fileHandleForReading.readDataToEndOfFile()
-            p.waitUntilExit()
-            if p.terminationStatus == 0, let s = String(data: data, encoding: .utf8) { blobs.append(s) }
+        p.standardError = FileHandle.nullDevice
+        p.standardInput = FileHandle.nullDevice
+        guard (try? p.run()) != nil else { return nil }
+        let data = out.fileHandleForReading.readDataToEndOfFile()
+        p.waitUntilExit()
+        guard p.terminationStatus == 0, let s = String(data: data, encoding: .utf8) else { return nil }
+        // `security -w` prints a secret with odd bytes as one hex string
+        let t = s.trimmingCharacters(in: .whitespacesAndNewlines)
+        if t.count % 2 == 0, !t.isEmpty, t.allSatisfy(\.isHexDigit) {
+            var bytes = [UInt8]()
+            var i = t.startIndex
+            while i < t.endIndex {
+                let j = t.index(i, offsetBy: 2)
+                bytes.append(UInt8(t[i..<j], radix: 16)!)
+                i = j
+            }
+            if let decoded = String(bytes: bytes, encoding: .utf8) { return decoded }
         }
-        if let s = try? String(contentsOf: claudeDir.appendingPathComponent(".credentials.json")) { blobs.append(s) }
+        return t
+    }
+
+    static func parseToken(_ blob: String) -> Token? {
+        guard let v = try? JSONSerialization.jsonObject(with: Data(blob.utf8)) as? [String: Any] else { return nil }
+        let o = v["claudeAiOauth"] as? [String: Any] ?? v
+        guard let access = o["accessToken"] as? String, !access.isEmpty else { return nil }
+        let exp = (o["expiresAt"] as? NSNumber).map { Date(timeIntervalSince1970: $0.doubleValue / 1000) }
+        return Token(access: access, expires: exp, plan: (o["subscriptionType"] as? String ?? "").capitalized)
+    }
+
+    /// The first unexpired sign-in among the config folders (Keychain first, then a credentials file).
+    func readToken() -> Token? {
         var found: [Token] = []
-        for blob in blobs {
-            guard let v = try? JSONSerialization.jsonObject(with: Data(blob.trimmingCharacters(in: .whitespacesAndNewlines).utf8)) as? [String: Any]
-            else { continue }
-            let o = v["claudeAiOauth"] as? [String: Any] ?? v
-            guard let access = o["accessToken"] as? String, !access.isEmpty else { continue }
-            let exp = (o["expiresAt"] as? Double).map { Date(timeIntervalSince1970: $0 / 1000) }
-            found.append(Token(access: access, expires: exp, plan: (o["subscriptionType"] as? String ?? "").capitalized))
+        for dir in preferredDirs() {
+            if let b = UsagePoller.keychainBlob(keychainService(for: dir)), let t = UsagePoller.parseToken(b) { found.append(t) }
+            if let b = try? String(contentsOf: dir.appendingPathComponent(".credentials.json"), encoding: .utf8), let t = UsagePoller.parseToken(b) { found.append(t) }
         }
         return found.first { ($0.expires ?? .distantFuture) > Date().addingTimeInterval(60) } ?? found.first
     }
@@ -350,8 +555,13 @@ final class UsagePoller {
     func poll(force: Bool = false) {
         guard !inFlight, Date() >= nextAllowed else { return }
         if !force, let f = fetchedAt, Date().timeIntervalSince(f) < 170 { return }
-        guard let token = UsagePoller.readToken() else {
-            fail("Sign in to Claude Code on this Mac")
+        guard let token = readToken() else {
+            if ProcessInfo.processInfo.environment["ANTHROPIC_API_KEY"] != nil || loginShellValue("ANTHROPIC_API_KEY") != nil {
+                fail("API key: no plan limits to show")
+            } else {
+                fail("Sign in to Claude Code on this Mac")
+            }
+            nextAllowed = Date().addingTimeInterval(300)
             return
         }
         if let exp = token.expires, exp < Date() {
@@ -362,7 +572,7 @@ final class UsagePoller {
         var req = URLRequest(url: URL(string: "https://api.anthropic.com/api/oauth/usage")!, timeoutInterval: 20)
         req.setValue("Bearer \(token.access)", forHTTPHeaderField: "Authorization")
         req.setValue("oauth-2025-04-20", forHTTPHeaderField: "anthropic-beta")
-        req.setValue("claude-buddy/1.0", forHTTPHeaderField: "User-Agent")
+        req.setValue("claude-buddy/1.1", forHTTPHeaderField: "User-Agent")
         req.setValue("application/json", forHTTPHeaderField: "Accept")
         inFlight = true
         URLSession.shared.dataTask(with: req) { data, resp, err in
@@ -385,27 +595,17 @@ final class UsagePoller {
                     self.fail("Usage service answered \(code)")
                     return
                 }
-                self.parse(v, plan: token.plan)
+                guard let parsed = UsageParse.meters(v, now: Date()) else {
+                    self.fail("No usage limits on this account")
+                    return
+                }
+                self.reading = (parsed.meters, parsed.note, token.plan)
+                self.fetchedAt = Date()
+                self.note = ""
+                log("usage: " + parsed.meters.map { "\($0.label) \($0.pct)%" }.joined(separator: ", "))
+                self.rebuild()
             }
         }.resume()
-    }
-
-    private func parse(_ v: [String: Any], plan: String) {
-        let iso = ISO8601DateFormatter()
-        iso.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        let isoPlain = ISO8601DateFormatter()
-        func window(_ key: String) -> (Int, Date?) {
-            guard let w = v[key] as? [String: Any] else { return (0, nil) }
-            let pct = Int(((w["utilization"] as? Double) ?? 0).rounded())
-            let reset = (w["resets_at"] as? String).flatMap { iso.date(from: $0) ?? isoPlain.date(from: $0) }
-            return (pct, reset)
-        }
-        let s = window("five_hour"), w = window("seven_day")
-        reading = (s.0, s.1, w.0, w.1, plan)
-        fetchedAt = Date()
-        note = ""
-        log("usage: session \(s.0)% weekly \(w.0)%")
-        rebuild()
     }
 
     private func fail(_ why: String) {
@@ -414,17 +614,49 @@ final class UsagePoller {
         rebuild()
     }
 
+    static func meterField(_ m: Meter, now: Date) -> String {
+        var pace = -1
+        var resetText = "Not started"
+        if let r = m.reset {
+            if let s = m.start, r > s { pace = Int((now.timeIntervalSince(s) / r.timeIntervalSince(s) * 1000).rounded()) }
+            if m.dated {
+                let f = DateFormatter()
+                f.dateFormat = "MMM d"
+                f.timeZone = TimeZone(identifier: "UTC")
+                resetText = "Resets " + f.string(from: r)
+            } else {
+                resetText = "Resets in " + compactDuration(r.timeIntervalSince(now))
+            }
+        }
+        let clean = { (s: String) in ascii(s, max: 24).replacingOccurrences(of: ";", with: ",") }
+        return "\(clean(m.label));\(m.pct);\(max(-1, min(1000, pace)));\(clean(resetText))"
+    }
+
+    static func compactDuration(_ t: TimeInterval) -> String {
+        let s = Int(max(0, t))
+        if s < 3600 { return "\(max(1, s / 60))m" }
+        if s < 86400 { return "\(s / 3600)h \(s / 60 % 60)m" }
+        return "\(s / 86400)d \(s / 3600 % 24)h"
+    }
+
+    /// The U line for given meters (also used by --parse-usage).
+    static func message(ok: Bool, age: Int, plan: String, note: String, meters: [Meter], now: Date) -> String {
+        (["U", ok ? "1" : "0", "\(age)", ascii(plan, max: 12), ascii(note, max: 44)]
+            + meters.prefix(2).map { meterField($0, now: now) }).joined(separator: "|")
+    }
+
     /// Rebuilt each send so the ages and reset countdowns stay current.
     func rebuild() {
         let now = Date()
-        func minutes(_ d: Date?) -> Int { d.map { max(0, Int($0.timeIntervalSince(now) / 60)) } ?? -1 }
         if let r = reading, let at = fetchedAt {
-            let age = Int(now.timeIntervalSince(at))
-            message = "U|1|\(r.s)|\(minutes(r.sr))|\(r.w)|\(minutes(r.wr))|\(ascii(r.plan, max: 12))|\(age)|\(ascii(note, max: 40))"
-            summary = "Session \(r.s)%  ·  Weekly \(r.w)%"
+            let shownNote = note.isEmpty ? r.note : note
+            message = UsagePoller.message(ok: true, age: Int(now.timeIntervalSince(at)), plan: r.plan, note: shownNote,
+                                          meters: r.meters, now: now)
+            summary = r.meters.map { "\($0.label.replacingOccurrences(of: "  5h", with: "")) \($0.pct)%" }.joined(separator: "  ·  ")
         } else {
-            message = "U|0|0|-1|0|-1||0|\(ascii(note.isEmpty ? "Asking Claude for usage" : note, max: 40))"
-            summary = note.isEmpty ? "Usage: waiting" : "Usage: \(note)"
+            let n = note.isEmpty ? "Asking Claude for usage" : note
+            message = UsagePoller.message(ok: false, age: 0, plan: "", note: n, meters: [], now: now)
+            summary = "Usage: \(n)"
         }
         onChange?()
     }
@@ -432,8 +664,21 @@ final class UsagePoller {
 
 // MARK: - Today's stats, from Claude Code transcripts
 
+/// A session as its transcript tells it: used when Claude Code's hooks don't reach us
+/// (sessions opened before the app, or hooks blocked by an organisation's settings).
+struct LiveSession {
+    var project = ""
+    var last = Date.distantPast
+    var working = false
+    var detail = ""
+    var turnStart: Date?
+    var endedAt: Date?
+}
+
 final class TodayScanner {
     private var day = Calendar.current.startOfDay(for: Date())
+    private(set) var live: [String: LiveSession] = [:]
+    private var lastWrite: [String: Date] = [:]  // per config folder
     private var offsets: [String: UInt64] = [:]
     private var prompts = Set<String>(), tools = Set<String>(), files = Set<String>()
     private var outTokens: [String: Int] = [:]
@@ -456,24 +701,44 @@ final class TodayScanner {
     func scan() {
         let start = Calendar.current.startOfDay(for: Date())
         if start != day { day = start; reset() }
-        let root = claudeDir.appendingPathComponent("projects")
-        guard let it = FileManager.default.enumerator(at: root, includingPropertiesForKeys: [.contentModificationDateKey, .fileSizeKey])
-        else { return }
-        for case let url as URL in it where url.pathExtension == "jsonl" {
-            let values = try? url.resourceValues(forKeys: [.contentModificationDateKey, .fileSizeKey])
-            guard let mod = values?.contentModificationDate, mod >= day, let size = values?.fileSize else { continue }
-            let from = offsets[url.path] ?? 0
-            if UInt64(size) <= from { continue }
-            guard let h = try? FileHandle(forReadingFrom: url) else { continue }
-            h.seek(toFileOffset: from)
-            let data = h.readDataToEndOfFile()
-            try? h.close()
-            guard let lastNewline = data.lastIndex(of: UInt8(ascii: "\n")) else { continue }
-            let session = url.deletingPathExtension().lastPathComponent
-            for line in data[..<lastNewline].split(separator: UInt8(ascii: "\n")) { process(Data(line), session: session) }
-            offsets[url.path] = from + UInt64(lastNewline + 1)
+        for dir in claudeDirs {
+            let root = dir.appendingPathComponent("projects")
+            guard let it = FileManager.default.enumerator(at: root, includingPropertiesForKeys: [.contentModificationDateKey, .fileSizeKey])
+            else { continue }
+            for case let url as URL in it where url.pathExtension == "jsonl" {
+                let values = try? url.resourceValues(forKeys: [.contentModificationDateKey, .fileSizeKey])
+                guard let mod = values?.contentModificationDate, mod >= day, let size = values?.fileSize else { continue }
+                lastWrite[dir.path] = max(lastWrite[dir.path] ?? .distantPast, mod)
+                let from = offsets[url.path] ?? 0
+                if UInt64(size) <= from { continue }
+                guard let h = try? FileHandle(forReadingFrom: url) else { continue }
+                h.seek(toFileOffset: from)
+                let data = h.readDataToEndOfFile()
+                try? h.close()
+                guard let lastNewline = data.lastIndex(of: UInt8(ascii: "\n")) else { continue }
+                // subagent transcripts count toward the day, but aren't sessions of their own
+                let session = url.path.contains("/subagents/") ? nil : url.deletingPathExtension().lastPathComponent
+                for line in data[..<lastNewline].split(separator: UInt8(ascii: "\n")) { process(Data(line), session: session) }
+                offsets[url.path] = from + UInt64(lastNewline + 1)
+            }
         }
+        live = live.filter { Date().timeIntervalSince($0.value.last) < 1800 }
         firstScan = false
+    }
+
+    /// Config folders, the most recently used first (whose sign-in to read usage with).
+    var dirsByUse: [URL] {
+        claudeDirs.sorted { (lastWrite[$0.path] ?? .distantPast) > (lastWrite[$1.path] ?? .distantPast) }
+    }
+
+    private func touch(_ session: String?, _ ts: Date, _ project: String, _ change: (inout LiveSession) -> Void) {
+        guard let id = session, Date().timeIntervalSince(ts) < 1800 else { return }
+        var l = live[id] ?? LiveSession()
+        if ts < l.last { return }
+        l.last = ts
+        if !project.isEmpty { l.project = ascii(project, max: 28) }
+        change(&l)
+        live[id] = l
     }
 
     private static func lineCount(_ s: String?) -> Int {
@@ -481,7 +746,7 @@ final class TodayScanner {
         return s.reduce(1) { $1 == "\n" ? $0 + 1 : $0 }
     }
 
-    private func process(_ line: Data, session: String) {
+    private func process(_ line: Data, session: String?) {
         guard let o = try? JSONSerialization.jsonObject(with: line) as? [String: Any],
               let ts = (o["timestamp"] as? String).flatMap({ iso.date(from: $0) }), ts >= day,
               let msg = o["message"] as? [String: Any] else { return }
@@ -493,11 +758,15 @@ final class TodayScanner {
 
         if o["type"] as? String == "user" {
             if texts.contains(where: { $0.hasPrefix("[Request interrupted") }) {
-                if !firstScan && Date().timeIntervalSince(ts) < 120 { onInterrupt?(session) }
+                if let id = session, !firstScan && Date().timeIntervalSince(ts) < 120 { onInterrupt?(id) }
+                touch(session, ts, project) { $0.working = false; $0.endedAt = nil; $0.turnStart = nil }
                 return
             }
+            let toolResult = (content as? [[String: Any]] ?? []).contains { $0["type"] as? String == "tool_result" }
+            if toolResult { touch(session, ts, project) { $0.working = true } }
             guard o["isMeta"] as? Bool != true, let text = texts.first, !text.hasPrefix("<"),
                   o["isSidechain"] as? Bool != true else { return }
+            touch(session, ts, project) { $0.working = true; $0.turnStart = ts; $0.detail = "Thinking"; $0.endedAt = nil }
             let key = o["promptId"] as? String ?? o["uuid"] as? String ?? UUID().uuidString
             if prompts.insert(key).inserted {
                 hours[hour] += 1
@@ -508,7 +777,15 @@ final class TodayScanner {
             if outTokens[id] == nil { hours[hour] += 1 }
             let usage = msg["usage"] as? [String: Any]
             outTokens[id] = max(outTokens[id] ?? 0, usage?["output_tokens"] as? Int ?? 0)
-            for item in content as? [[String: Any]] ?? [] where item["type"] as? String == "tool_use" {
+            let items = content as? [[String: Any]] ?? []
+            if let lastTool = items.last(where: { $0["type"] as? String == "tool_use" }) {
+                let d = Tracker.describe(lastTool["name"] as? String ?? "", lastTool["input"] as? [String: Any] ?? [:])
+                touch(session, ts, project) { $0.working = true; $0.detail = d.detail }
+            }
+            if msg["stop_reason"] as? String == "end_turn" {
+                touch(session, ts, project) { $0.working = false; $0.endedAt = ts }
+            }
+            for item in items where item["type"] as? String == "tool_use" {
                 guard let tid = item["id"] as? String, tools.insert(tid).inserted else { continue }
                 if !project.isEmpty { projects[project, default: 0] += 1 }
                 let input = item["input"] as? [String: Any] ?? [:]
@@ -658,8 +935,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationDidFinishLaunching(_ n: Notification) {
         try? FileManager.default.createDirectory(at: buddyDir, withIntermediateDirectories: true)
         try? "\(getpid())\n".write(to: buddyDir.appendingPathComponent("app.pid"), atomically: true, encoding: .utf8)
-        log("Claude Buddy started (pid \(getpid()))")
-        if !Hooks.installed || (try? String(contentsOf: Hooks.script)) != Hooks.scriptText {
+        log("Claude Buddy started (pid \(getpid())), Claude folders: " + claudeDirs.map(\.path).joined(separator: ", "))
+        if let why = Hooks.blockedBySettings { log("hooks blocked: \(why); following transcripts instead") }
+        if !Hooks.installed || (try? String(contentsOf: Hooks.script, encoding: .utf8)) != Hooks.scriptText {
             do { try Hooks.install() } catch { log("couldn't install hooks: \(error.localizedDescription)") }
         }
 
@@ -673,6 +951,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             DispatchQueue.main.asyncAfter(deadline: .now() + 5) { self?.usage.poll() }
         }
         today.onInterrupt = { [weak self] id in self?.tracker.interrupted(id) }
+        usage.preferredDirs = { [weak self] in self?.today.dirsByUse ?? claudeDirs }
 
         today.scan()
         usage.poll(force: true)
@@ -708,6 +987,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func scanToday() {
         today.scan()
+        tracker.live = today.live
         let d = today.message
         if d != lastToday {
             if lastToday.isEmpty { log("today \(d)") }
@@ -761,6 +1041,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         info(moodText())
         info(usage.summary)
         info(today.summary)
+        if let why = Hooks.blockedBySettings {
+            info("Limited view: \(why)")
+            info("    (no \"Your turn\" alerts; activity comes from transcripts)")
+        } else if tracker.hooklessActive > 0 {
+            info("Restart Claude sessions opened before Claude Buddy for full detail")
+        }
+        if claudeDirs.count > 1 {
+            info("Claude folders: " + claudeDirs.map { $0.path.replacingOccurrences(of: home.path, with: "~") }.joined(separator: ", "))
+        }
         menu.addItem(.separator())
         let hooks = NSMenuItem(title: "Watch Claude Code (hooks)", action: #selector(toggleHooks), keyEquivalent: "")
         hooks.state = Hooks.installed ? .on : .off
@@ -801,6 +1090,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     @objc func refreshUsage() { usage.poll(force: true) }
     @objc func openLog() { NSWorkspace.shared.open(logURL) }
+}
+
+// `ClaudeBuddy --parse-usage answer.json [ISO-time]` prints the device's usage line for a
+// saved usage-endpoint answer (for testing account types we can't sign in to).
+if let i = CommandLine.arguments.firstIndex(of: "--parse-usage"), i + 1 < CommandLine.arguments.count {
+    let data = try! Data(contentsOf: URL(fileURLWithPath: CommandLine.arguments[i + 1]))
+    let now = i + 2 < CommandLine.arguments.count ? UsageParse.date(CommandLine.arguments[i + 2])! : Date()
+    let v = try! JSONSerialization.jsonObject(with: data) as! [String: Any]
+    if let r = UsageParse.meters(v, now: now) {
+        print(UsagePoller.message(ok: true, age: 0, plan: "Test", note: r.note, meters: r.meters, now: now))
+    } else {
+        print(UsagePoller.message(ok: false, age: 0, plan: "", note: "No usage limits on this account", meters: [], now: now))
+    }
+    exit(0)
 }
 
 // `ClaudeBuddy --uninstall-hooks` removes the hooks without starting the app.

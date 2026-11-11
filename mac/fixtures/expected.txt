@@ -1,0 +1,8 @@
+pro.json 2026-10-14T01:20:00Z U|1|0|Test||Session  5h;35;733;Resets in 1h 20m|Weekly;20;294;Resets in 4d 22h
+pro-window-not-started.json 2026-10-14T02:30:00Z U|1|0|Test||Session  5h;0;-1;Not started|Weekly;40;926;Resets in 12h 30m
+pro-idle-with-extra-usage.json 2026-10-14T05:00:00Z U|1|0|Test||Session  5h;0;-1;Not started|Weekly;20;315;Resets in 4d 19h
+weekly-only.json 2026-11-01T13:30:00Z U|1|0|Test|No 5-hour limit on this plan|Weekly;48;211;Resets in 5d 12h
+enterprise-spend-limits.json 2026-10-14T01:20:00Z U|1|0|Test|Spend limit set by your organisation|Monthly spend;54;421;Resets Nov 1
+enterprise-spend-top-level.json 2026-10-14T01:20:00Z U|1|0|Test|Spend limit set by your organisation|Monthly spend;5;421;Resets Nov 1
+enterprise-spend-reached.json 2026-10-14T01:20:00Z U|1|0|Test|Spend limit set by your organisation|Monthly spend;100;421;Resets Nov 1
+uncapped.json 2026-10-14T01:20:00Z U|0|0||No usage limits on this account

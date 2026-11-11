@@ -212,7 +212,7 @@ static void startDemo() {
   demoStep = 0;
   demoAt = 0;
   handleMessage("T|1762862400|19800|1|Demo MacBook");
-  handleMessage("U|1|42|175|28|8460|Pro|20|");
+  handleMessage("U|1|20|Pro||Session  5h;42;417;Resets in 2h 55m|Weekly;28;161;Resets in 5d 21h");
   handleMessage("D|23|187|9|842|61234|0,0,0,0,0,0,0,0,2,14,30,22,8,0,12,40,35,28,9,0,0,0,0,0|diy-pet");
   handleMessage("A|12:38|Read main.cpp");
   handleMessage("A|12:40|Edit face.cpp");
@@ -235,9 +235,10 @@ static void handleLine(const char* line) {
     soundOn = !soundOn;
     Serial.printf("sound %s\n", soundOn ? "on" : "off");
   } else if (!strcmp(line, "status")) {
-    Serial.printf("page=%d ble=%d mood=%d detail='%s' usage=%d/%d%% %d/%d%% clock=%d host='%s'\n", page + 1,
-                  bt::connected(), (int)activity.mood, activity.detail, usage.known, usage.session, usage.ok,
-                  usage.week, clockKnown(), hostName);
+    Serial.printf("page=%d ble=%d mood=%d detail='%s' usage=%d/%d meters=%d", page + 1, bt::connected(),
+                  (int)activity.mood, activity.detail, usage.known, usage.ok, usage.count);
+    for (int i = 0; i < usage.count; ++i) Serial.printf(" [%s %d%%]", usage.meters[i].label, usage.meters[i].pct);
+    Serial.printf(" clock=%d host='%s'\n", clockKnown(), hostName);
   } else if (!strcmp(line, "shot")) {
     // Raw RGB565, little-endian, row by row (tools/screenshot.py).
     uint32_t now = millis();

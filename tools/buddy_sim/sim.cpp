@@ -24,7 +24,7 @@ static void save(const char* name){
 int main(){
   simMillis=500000;
   handleMessage("T|1762862400|19800|1|Madhu's MacBook");
-  handleMessage("U|1|42|175|61|1500|Pro|20|");
+  handleMessage("U|1|20|Pro||Session  5h;42;417;Resets in 2h 54m|Weekly;61;851;Resets in 1d 0h");
   handleMessage("D|23|187|9|842|61234|0,0,0,0,0,0,0,0,2,14,30,22,8,0,12,40,35,28,9,0,0,0,0,0|diy-pet");
   handleMessage("A|12:40|Edit face.cpp"); handleMessage("A|12:41|Bash: ./pet.sh build");
   const char* moods[]={"S|1|134|2|diy-pet|Editing buddy/face.cpp","S|2|5|2|diy-pet|Needs permission: Bash","S|3|1|2|diy-pet|Finished in 6m 12s","S|0|300|2|diy-pet|"};
@@ -34,4 +34,10 @@ int main(){
   fb->fillScreen(0); face::draw(simMillis,false); header(0); save("face_lost.ppm");
   fb->fillScreen(0); meters::draw(simMillis,true); header(1); save("meters.ppm");
   fb->fillScreen(0); day::draw(simMillis,true); header(2); save("day.ppm");
+  handleMessage("U|1|20|Max|No 5-hour limit on this plan|Weekly;48;211;Resets in 5d 12h");
+  fb->fillScreen(0); meters::draw(simMillis,true); header(1); save("meters_weekly.ppm");
+  handleMessage("U|1|20|Enterprise|Spend limit set by your organisation|Monthly spend;54;421;Resets Nov 1");
+  fb->fillScreen(0); meters::draw(simMillis,true); header(1); save("meters_spend.ppm");
+  handleMessage("U|0|0||No usage limits on this account");
+  fb->fillScreen(0); meters::draw(simMillis,true); header(1); save("meters_none.ppm");
 }

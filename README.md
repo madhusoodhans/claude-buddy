@@ -21,7 +21,7 @@ Swipe left/right (or press + / −) between three pages. The time is always at t
    - Tap it to make it giggle, shake the device to make it dizzy, and tilt it to make it look around.
 
    ![The buddy's moods](docs/images/moods.png)
-2. **Usage**: your plan's 5-hour session and weekly limits, with reset countdowns and a pace marker.
+2. **Usage**: your plan's 5-hour session and weekly limits, with reset countdowns and a pace marker. Plans with only a weekly limit show that alone. Spend-capped Enterprise accounts show monthly spend against the cap.
 3. **Today**: lines of code written, files, prompts, tool calls, output tokens, activity by hour, and the latest actions.
 
 Touch and hold anywhere for 1 second to turn sound on or off.
@@ -45,8 +45,10 @@ Macs with macOS 12 or later. Then:
 - **Bluetooth:** click **Allow** when it asks.
 - **Claude Code** must be installed and signed in on that Mac.
 
-Details, including what it changes in `~/.claude/settings.json`, are in
-[mac/README.md](mac/README.md). To build it yourself, run `mac/build.sh`. It
+It works with Pro, Max, Team and Enterprise accounts, and API-key setups get
+the Buddy and Today pages. On company Macs where hooks are locked down, it
+falls back to reading transcripts. Details, including what it changes in
+`~/.claude/settings.json`, are in [mac/README.md](mac/README.md). To build it yourself, run `mac/build.sh`. It
 needs only `swiftc`.
 
 ### 2. The device firmware

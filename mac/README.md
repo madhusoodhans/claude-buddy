@@ -23,10 +23,38 @@ The device talks to one Mac at a time. To move it to another Mac, quit Claude
 Buddy on the first one (menu ✻ → Quit). The device then shows "Looking for
 your Mac" until the other one connects.
 
+## Plans and accounts
+
+| Account | Buddy + Today pages | Usage page |
+| --- | --- | --- |
+| Pro, Max, Team | yes | 5-hour session + weekly limit |
+| Plans with only a weekly limit | yes | weekly limit, "No 5-hour limit on this plan" |
+| Enterprise with a spend cap | yes | monthly spend vs the cap, reset date |
+| API key, Bedrock, Vertex | yes | "No usage limits" (there are none to show) |
+
+Usage comes from Claude Code's own sign-in (read only, never refreshed) and
+`api.anthropic.com/api/oauth/usage`, the endpoint `/usage` uses. Test answers for
+each account shape are in `fixtures/` (`fixtures/test.sh`).
+
+### Company-managed Macs
+
+- If your organisation lets Claude Code run only its own hooks (or turns hooks
+  off), Claude Buddy follows Claude through its transcripts instead. Cooking and
+  done still work, and so does the Today page, but there are no "Your turn!"
+  alerts. The menu says "Limited view" when this happens.
+- Claude Code sessions opened before Claude Buddy are followed the same way
+  until they're restarted.
+- Using a custom Claude folder (`CLAUDE_CONFIG_DIR`)? It's picked up from your
+  shell. To add folders by hand, list them in `~/.claude-buddy/config.json` as
+  `{"claudeConfigDirs": ["~/work-claude"]}`. Hooks and transcripts cover every
+  folder. Usage uses the sign-in of the folder used most recently.
+- If IT blocks apps from outside the App Store, Claude Buddy needs an exception.
+  It's ad-hoc signed, not notarized.
+
 ## What it changes on the Mac
 
-- On first launch it adds a hook to `~/.claude/settings.json` for 7 Claude
-  Code events. The hook runs `~/.claude-buddy/hook.sh`, which appends the event
+- On first launch it adds a hook to `settings.json` in each Claude folder
+  (`~/.claude` by default) for 7 Claude Code events. The hook runs `~/.claude-buddy/hook.sh`, which appends the event
   to `~/.claude-buddy/events.log`. The app reads the log and deletes it. The
   hook prints nothing and does nothing while the app isn't running.
   The original settings are saved once as `settings.json.before-claude-buddy`.

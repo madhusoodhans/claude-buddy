@@ -6,11 +6,20 @@
 
 enum class Mood : uint8_t { Idle, Working, Waiting, Done };
 
+// One bar on the usage page. The Mac decides what they are: a 5-hour session and
+// a weekly limit for most plans, the weekly one alone, or an organisation's spend cap.
+struct Meter {
+  char label[24] = "";
+  int pct = 0;
+  int pace = -1;  // how much of the window has gone by, in 1/1000, -1 = unknown
+  char reset[28] = "";  // "Resets in 2h 54m", "Resets Dec 1", "Not started"
+};
+
 struct Usage {
   bool known = false;  // a U message arrived
   bool ok = false;
-  int session = 0, sessionReset = -1;  // %, minutes
-  int week = 0, weekReset = -1;
+  int count = 0;  // meters (0..2)
+  Meter meters[2];
   char plan[16] = "";
   char note[48] = "";
   uint32_t at = 0;  // millis() of the reading (age already subtracted)

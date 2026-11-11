@@ -41,16 +41,26 @@ bool handleMessage(const char* line) {
       haveClock = true;
       break;
     case 'U':
-      if (n < 9) return false;
+      if (n < 5) return false;
       usage.known = true;
       usage.ok = atoi(f[1]) != 0;
-      usage.session = atoi(f[2]);
-      usage.sessionReset = atoi(f[3]);
-      usage.week = atoi(f[4]);
-      usage.weekReset = atoi(f[5]);
-      strlcpy(usage.plan, f[6], sizeof(usage.plan));
-      usage.at = now - (uint32_t)max(0, atoi(f[7])) * 1000;
-      strlcpy(usage.note, f[8], sizeof(usage.note));
+      usage.at = now - (uint32_t)max(0, atoi(f[2])) * 1000;
+      strlcpy(usage.plan, f[3], sizeof(usage.plan));
+      strlcpy(usage.note, f[4], sizeof(usage.note));
+      usage.count = 0;
+      for (int i = 5; i < n && usage.count < 2; ++i) {  // label;pct;pace;reset
+        char* m[4];
+        int k = 0;
+        m[k++] = f[i];
+        for (char* p = f[i]; *p && k < 4; ++p)
+          if (*p == ';') { *p = 0; m[k++] = p + 1; }
+        if (k < 4) continue;
+        Meter& meter = usage.meters[usage.count++];
+        strlcpy(meter.label, m[0], sizeof(meter.label));
+        meter.pct = atoi(m[1]);
+        meter.pace = atoi(m[2]);
+        strlcpy(meter.reset, m[3], sizeof(meter.reset));
+      }
       break;
     case 'S': {
       if (n < 6) return false;

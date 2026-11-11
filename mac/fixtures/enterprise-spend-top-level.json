@@ -1,0 +1,1 @@
+{"five_hour":null,"seven_day":null,"pace":null,"limits":[],"extra_usage":{"is_enabled":true,"monthly_limit":20000,"used_credits":982.0,"utilization":4.91,"currency":"USD","spend_limit_reached":false},"spend":{"used":{"amount_minor":982,"currency":"USD","exponent":2},"limit":{"amount_minor":20000,"currency":"USD","exponent":2},"percent":5,"severity":"normal","enabled":true}}

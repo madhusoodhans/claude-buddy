@@ -1,0 +1,1 @@
+{"extra_usage":{"is_enabled":true,"monthly_limit":50000,"used_credits":27140,"utilization":54,"currency":"USD"},"limits":[{"kind":"spend","group":"monthly","percent":54,"resets_at":"2026-11-01T00:00:00.000Z","severity":"normal","is_active":true}]}
