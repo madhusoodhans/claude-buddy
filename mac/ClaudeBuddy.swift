@@ -234,6 +234,7 @@ final class Session {
 
 final class Tracker {
     var sessions: [String: Session] = [:]
+    private(set) var lastActivity = Date.distantPast
     var feed: [String] = []  // "A|hh:mm|text" lines, newest last
     var onFeed: ((String) -> Void)?
     var onStop: (() -> Void)?
@@ -285,6 +286,7 @@ final class Tracker {
         let s = sessions[id] ?? Session(id)
         sessions[id] = s
         s.last = Date()
+        lastActivity = s.last
         if let cwd = e["cwd"] as? String { s.project = ascii(baseName(cwd), max: 28) }
         let tool = e["tool_name"] as? String ?? ""
         let input = e["tool_input"] as? [String: Any] ?? [:]
@@ -357,6 +359,7 @@ final class Tracker {
             let s = Session(id)
             s.project = l.project
             s.last = l.last
+            lastActivity = max(lastActivity, l.last)
             if l.working && now.timeIntervalSince(l.last) < 10 * 60 {
                 s.mood = .working
                 s.detail = l.detail
@@ -726,6 +729,9 @@ final class TodayScanner {
         firstScan = false
     }
 
+    /// When Claude last wrote a transcript on this Mac.
+    var lastActivity: Date { lastWrite.values.max() ?? .distantPast }
+
     /// Config folders, the most recently used first (whose sign-in to read usage with).
     var dirsByUse: [URL] {
         claudeDirs.sorted { (lastWrite[$0.path] ?? .distantPast) > (lastWrite[$1.path] ?? .distantPast) }
@@ -921,6 +927,224 @@ final class DeviceLink: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate
     }
 }
 
+// MARK: - Remote machines (Claude Code over SSH)
+
+/// ~/.claude-buddy/config.json, read and written without losing keys we don't know.
+enum Config {
+    static let url = buddyDir.appendingPathComponent("config.json")
+
+    static func load() -> [String: Any] {
+        guard let d = try? Data(contentsOf: url), let o = try? JSONSerialization.jsonObject(with: d) as? [String: Any] else { return [:] }
+        return o
+    }
+
+    static func save(_ o: [String: Any]) {
+        if let d = try? JSONSerialization.data(withJSONObject: o, options: [.prettyPrinted, .withoutEscapingSlashes]) {
+            try? d.write(to: url, options: .atomic)
+        }
+    }
+
+    static var remotes: [[String: Any]] {
+        get { load()["remotes"] as? [[String: Any]] ?? [] }
+        set { var o = load(); o["remotes"] = newValue; save(o) }
+    }
+}
+
+/// Host aliases from ~/.ssh/config (no wildcard patterns), for the Add Remote Machine menu.
+func sshConfigHosts() -> [String] {
+    guard let text = try? String(contentsOf: home.appendingPathComponent(".ssh/config"), encoding: .utf8) else { return [] }
+    var hosts: [String] = []
+    for line in text.components(separatedBy: .newlines) {
+        let parts = line.trimmingCharacters(in: .whitespaces).split(whereSeparator: { $0 == " " || $0 == "\t" || $0 == "=" })
+        guard parts.count > 1, parts[0].lowercased() == "host" else { continue }
+        for h in parts.dropFirst() where !h.contains("*") && !h.contains("?") && !h.hasPrefix("!") && !hosts.contains(String(h)) {
+            hosts.append(String(h))
+        }
+    }
+    return hosts
+}
+
+/// One machine where Claude Code runs, followed over SSH. The app sends ../remote/buddy-agent.py
+/// with every connect (so it always matches the app) and reads the agent's protocol lines back.
+final class RemoteSource {
+    let host: String
+    private let testHome: String?  // tests only: run the agent here with this HOME instead of over SSH
+    var state = "Connecting"
+    var connected = false
+    var status = "S|0|0|0||"
+    var usage: String?
+    var today: String?
+    var lastActivity = Date.distantPast
+    var account = ""
+    var hooks = ""
+    var note = ""
+    var onFeed: ((String) -> Void)?
+    var onChange: (() -> Void)?
+
+    private var process: Process?
+    private var stdin: Pipe?
+    private var buffer = Data()
+    private var errorText = ""
+    private var retry: TimeInterval = 5
+    private var lastLine = Date()
+    private var stopped = false
+    private var watchdog: Timer?
+
+    init(host: String, testHome: String? = nil) {
+        self.host = host
+        self.testHome = testHome
+    }
+
+    static var agentScript: Data? {
+        Bundle.main.url(forResource: "buddy-agent", withExtension: "py").flatMap { try? Data(contentsOf: $0) }
+    }
+
+    func start() {
+        guard !stopped, process == nil else { return }
+        guard let script = RemoteSource.agentScript else {
+            state = "Agent missing from the app bundle"
+            onChange?()
+            return
+        }
+        let inner = "mkdir -p \"$HOME/.claude-buddy\" && head -c \(script.count) > \"$HOME/.claude-buddy/agent.py\" && "
+            + "{ command -v python3 >/dev/null 2>&1 || { echo \"E|python3 is not installed there\"; exit 3; }; } && "
+            + "exec python3 -u \"$HOME/.claude-buddy/agent.py\""
+        let p = Process()
+        if let testHome = testHome {
+            p.executableURL = URL(fileURLWithPath: "/bin/sh")
+            p.arguments = ["-c", inner]
+            var env = ProcessInfo.processInfo.environment
+            env["HOME"] = testHome
+            p.environment = env
+        } else {
+            p.executableURL = URL(fileURLWithPath: "/usr/bin/ssh")
+            // sh -c keeps it working whatever the login shell is (bash, zsh, fish)
+            p.arguments = ["-T", "-o", "BatchMode=yes", "-o", "ConnectTimeout=15", "-o", "ServerAliveInterval=15",
+                           "-o", "ServerAliveCountMax=3", host, "sh -c '\(inner)'"]
+        }
+        let out = Pipe(), err = Pipe(), input = Pipe()
+        p.standardOutput = out
+        p.standardError = err
+        p.standardInput = input
+        out.fileHandleForReading.readabilityHandler = { [weak self] h in
+            let d = h.availableData
+            DispatchQueue.main.async { self?.received(d) }
+        }
+        err.fileHandleForReading.readabilityHandler = { [weak self] h in
+            let d = h.availableData
+            guard let text = String(data: d, encoding: .utf8) else { return }
+            let lines = text.split(whereSeparator: \.isNewline).map { $0.trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty }
+            if let last = lines.last { DispatchQueue.main.async { self?.errorText = last } }
+        }
+        p.terminationHandler = { [weak self] proc in
+            DispatchQueue.main.async { self?.ended(proc.terminationStatus) }
+        }
+        errorText = ""
+        state = connected ? "Reconnecting" : "Connecting"
+        do {
+            try p.run()
+        } catch {
+            state = "Couldn't start ssh: \(error.localizedDescription)"
+            onChange?()
+            return
+        }
+        process = p
+        stdin = input
+        input.fileHandleForWriting.write(script)  // the agent's copy; the stream then stays open
+        lastLine = Date()
+        watchdog?.invalidate()
+        watchdog = Timer.scheduledTimer(withTimeInterval: 15, repeats: true) { [weak self] _ in
+            guard let self = self, let p = self.process else { return }
+            if Date().timeIntervalSince(self.lastLine) > 45 { log("\(self.host): no word for 45s, reconnecting"); p.terminate() }
+        }
+        log("\(host): connecting")
+        onChange?()
+    }
+
+    func stop() {
+        stopped = true
+        watchdog?.invalidate()
+        process?.terminate()
+    }
+
+    func reconnect() {
+        retry = 5
+        if let p = process { p.terminate() } else { start() }
+    }
+
+    /// Removing a machine: take our hooks back out of its Claude Code settings.
+    func uninstallHooks() {
+        guard testHome == nil else { return }
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: "/usr/bin/ssh")
+        p.arguments = ["-T", "-o", "BatchMode=yes", "-o", "ConnectTimeout=15", host,
+                       "sh -c 'python3 \"$HOME/.claude-buddy/agent.py\" --uninstall-hooks; rm -f \"$HOME/.claude-buddy/hook.sh\"'"]
+        p.standardOutput = FileHandle.nullDevice
+        p.standardError = FileHandle.nullDevice
+        try? p.run()
+    }
+
+    private func received(_ d: Data) {
+        guard !d.isEmpty else { return }
+        buffer.append(d)
+        while let nl = buffer.firstIndex(of: UInt8(ascii: "\n")) {
+            let line = String(decoding: buffer[buffer.startIndex..<nl], as: UTF8.self)
+            buffer.removeSubrange(buffer.startIndex...nl)
+            handle(line)
+        }
+    }
+
+    private func handle(_ line: String) {
+        lastLine = Date()
+        let f = line.split(separator: "|", omittingEmptySubsequences: false).map(String.init)
+        guard let kind = f.first else { return }
+        if !connected && kind != "E" {
+            connected = true
+            retry = 5
+            state = "Connected"
+            log("\(host): connected")
+        }
+        switch kind {
+        case "S": status = line
+        case "U": usage = line
+        case "D": today = line
+        case "A" where f.count >= 3: onFeed?("A|\(f[1])|\(ascii(host, max: 12)): \(f[2])")
+        case "R" where f.count >= 5:
+            if let ago = Double(f[1]), ago >= 0 { lastActivity = Date().addingTimeInterval(-ago) }
+            hooks = f[2]
+            account = f[3]
+        case "E":
+            note = f.dropFirst().joined(separator: "|")
+            log("\(host): \(note)")
+        default: break
+        }
+        onChange?()
+    }
+
+    private func ended(_ code: Int32) {
+        process = nil
+        stdin = nil
+        connected = false
+        status = "S|0|0|0||"
+        watchdog?.invalidate()
+        if stopped { return }
+        let e = errorText
+        if note.hasPrefix("python3 is not installed") { state = "python3 isn't installed there" }
+        else if e.contains("Permission denied") { state = "SSH login failed: needs a key (no password prompts here)" }
+        else if e.contains("Could not resolve hostname") { state = "Unknown host" }
+        else if e.contains("timed out") || e.contains("No route") || e.contains("Network is unreachable") { state = "Can't reach it (VPN?)" }
+        else if e.contains("Host key verification failed") { state = "Host key not trusted yet: ssh to it once in Terminal" }
+        else if e.contains("passphrase") { state = "SSH key needs its passphrase: add it with ssh-add" }
+        else if !e.isEmpty { state = ascii(e, max: 70) }
+        else { state = "Disconnected" }
+        log("\(host): ended (\(code)) \(e)")
+        let wait = retry
+        retry = min(retry * 2, 120)
+        DispatchQueue.main.asyncAfter(deadline: .now() + wait) { [weak self] in self?.start() }
+        onChange?()
+    }
+}
+
 // MARK: - The app
 
 final class AppDelegate: NSObject, NSApplicationDelegate {
@@ -929,8 +1153,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     let today = TodayScanner()
     var link: DeviceLink!
     var item: NSStatusItem!
+    var remotes: [RemoteSource] = []
     var lastStatus = "", lastToday = ""
+    var usageSource = "This Mac"
     var timers: [Timer] = []
+    private var menuDirty = false
 
     func applicationDidFinishLaunching(_ n: Notification) {
         try? FileManager.default.createDirectory(at: buddyDir, withIntermediateDirectories: true)
@@ -945,7 +1172,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         link = DeviceLink()
         link.onReady = { [weak self] in self?.sendAll(includeFeed: true) }
         link.onChange = { [weak self] in self?.refreshMenu() }
-        usage.onChange = { [weak self] in self?.refreshMenu() }
+        usage.onChange = { [weak self] in self?.menuDirty = true }
         tracker.onFeed = { [weak self] line in self?.link.send(line) }
         tracker.onStop = { [weak self] in
             DispatchQueue.main.asyncAfter(deadline: .now() + 5) { self?.usage.poll() }
@@ -953,16 +1180,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         today.onInterrupt = { [weak self] id in self?.tracker.interrupted(id) }
         usage.preferredDirs = { [weak self] in self?.today.dirsByUse ?? claudeDirs }
 
+        for r in Config.remotes { if let host = r["host"] as? String { addRemote(host, testHome: r["testHome"] as? String, save: false) } }
+
         today.scan()
+        tracker.live = today.live
         usage.poll(force: true)
         every(0.5) { [weak self] in self?.tick() }
         every(3) { [weak self] in self?.scanToday() }
         every(10) { [weak self] in self?.sendAll(includeFeed: false) }
         every(60) { [weak self] in self?.usage.poll() }
+        every(1) { [weak self] in
+            if self?.menuDirty == true { self?.menuDirty = false; self?.refreshMenu() }
+        }
         refreshMenu()
     }
 
     func applicationWillTerminate(_ n: Notification) {
+        remotes.forEach { $0.stop() }
         try? FileManager.default.removeItem(at: buddyDir.appendingPathComponent("app.pid"))
     }
 
@@ -972,23 +1206,114 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         timers.append(t)
     }
 
+    // MARK: Machines
+
+    func addRemote(_ host: String, testHome: String? = nil, save: Bool = true) {
+        guard !remotes.contains(where: { $0.host == host }) else { return }
+        let r = RemoteSource(host: host, testHome: testHome)
+        r.onFeed = { [weak self] line in self?.link.send(line) }
+        r.onChange = { [weak self] in self?.menuDirty = true }
+        remotes.append(r)
+        if save {
+            var list = Config.remotes
+            list.append(["host": host])
+            Config.remotes = list
+            log("added remote machine \(host)")
+        }
+        r.start()
+    }
+
+    func removeRemote(_ host: String) {
+        guard let i = remotes.firstIndex(where: { $0.host == host }) else { return }
+        let r = remotes.remove(at: i)
+        r.stop()
+        r.uninstallHooks()
+        Config.remotes = Config.remotes.filter { $0["host"] as? String != host }
+        log("removed remote machine \(host)")
+        refreshMenu()
+    }
+
+    private struct Source {
+        let name: String
+        let remote: Bool
+        let status: [String]  // S line fields
+        let last: Date
+        let usage: String?
+        let today: String?
+    }
+
+    private func sources() -> [Source] {
+        var all = [Source(name: "This Mac", remote: false, status: fields(tracker.status()),
+                          last: max(tracker.lastActivity, today.lastActivity), usage: usage.message, today: today.message)]
+        for r in remotes where r.connected {
+            all.append(Source(name: r.host, remote: true, status: fields(r.status), last: r.lastActivity, usage: r.usage, today: r.today))
+        }
+        return all
+    }
+
+    private func fields(_ line: String) -> [String] {
+        var f = line.split(separator: "|", omittingEmptySubsequences: false).map(String.init)
+        while f.count < 6 { f.append("") }
+        return f
+    }
+
+    /// What the device shows: the session that most needs you, on whichever machine.
+    func pooledStatus() -> String {
+        let all = sources()
+        let rank = [2: 3, 1: 2, 3: 1, 0: 0]
+        let top = all.max { a, b in
+            (rank[Int(a.status[1]) ?? 0] ?? 0, a.last) < (rank[Int(b.status[1]) ?? 0] ?? 0, b.last)
+        }!
+        let sessions = all.reduce(0) { $0 + (Int($1.status[3]) ?? 0) }
+        var project = top.status[4]
+        if top.remote { project = ascii(top.name, max: 12) + (project.isEmpty ? "" : ": " + project) }
+        return "S|\(top.status[1])|\(top.status[2])|\(sessions)|\(ascii(project, max: 31))|\(top.status[5])"
+    }
+
+    /// Usage from the machine where Claude was used most recently (with a reading to show).
+    func pooledUsage() -> String {
+        let all = sources()
+        let readable = all.filter { $0.usage?.hasPrefix("U|1|") == true }
+        let pick = (readable.isEmpty ? all.filter { $0.usage != nil } : readable).max { $0.last < $1.last }
+        usageSource = pick?.name ?? "This Mac"
+        return pick?.usage ?? usage.message
+    }
+
+    /// Today's numbers, added up over every machine.
+    func pooledToday() -> String {
+        var sums = [Int](repeating: 0, count: 5)
+        var hours = [Int](repeating: 0, count: 24)
+        var top = "", topTools = -1
+        for s in sources() {
+            guard let d = s.today else { continue }
+            let f = fields(d)
+            guard f.count >= 8 else { continue }
+            for i in 0..<5 { sums[i] += Int(f[i + 1]) ?? 0 }
+            for (h, v) in f[6].split(separator: ",").enumerated() where h < 24 { hours[h] += Int(v) ?? 0 }
+            if (Int(f[2]) ?? 0) > topTools { topTools = Int(f[2]) ?? 0; top = f[7] }
+        }
+        return "D|" + sums.map(String.init).joined(separator: "|") + "|" + hours.map(String.init).joined(separator: ",") + "|" + top
+    }
+
+    // MARK: Sending
+
     private func tick() {
         tracker.drainEvents()
-        let s = tracker.status()
+        let s = pooledStatus()
         // The seconds field ticks; only push when something else changed.
-        let key = s.split(separator: "|", omittingEmptySubsequences: false).enumerated().filter { $0.offset != 2 }.map { String($0.element) }.joined(separator: "|")
+        let key = fields(s).enumerated().filter { $0.offset != 2 }.map { $0.element }.joined(separator: "|")
         if key != lastStatus {
             lastStatus = key
             link.send(s)
             log("status \(s)")
-            refreshMenu()
+            menuDirty = true
         }
     }
 
     private func scanToday() {
         today.scan()
         tracker.live = today.live
-        let d = today.message
+        let d = pooledToday()
         if d != lastToday {
             if lastToday.isEmpty { log("today \(d)") }
             lastToday = d
@@ -1007,66 +1332,140 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         guard link.connected else { return }
         usage.rebuild()
         link.send(timeMessage())
-        link.send(usage.message)
-        link.send(tracker.status())
-        link.send(today.message)
+        link.send(pooledUsage())
+        link.send(pooledStatus())
+        link.send(pooledToday())
         if includeFeed { tracker.feed.forEach(link.send) }
     }
 
     // MARK: Menu
 
-    private func moodText() -> String {
-        let f = tracker.status().split(separator: "|", omittingEmptySubsequences: false).map(String.init)
-        let detail = f.count > 5 && !f[5].isEmpty ? " – \(f[5])" : ""
+    private static func moodWord(_ f: [String]) -> String {
         switch Int(f[1]) ?? 0 {
-        case 1: return "Claude is cooking" + detail
-        case 2: return "Claude needs you" + detail
-        case 3: return "Claude is done" + detail
+        case 1: return "cooking"
+        case 2: return "needs you"
+        case 3: return "done"
+        default: return "napping"
+        }
+    }
+
+    private func moodText() -> String {
+        let f = fields(pooledStatus())
+        let detail = !f[5].isEmpty ? " – \(f[5])" : ""
+        let place = remotes.isEmpty || f[4].isEmpty ? "" : " (\(f[4]))"
+        switch Int(f[1]) ?? 0 {
+        case 1: return "Claude is cooking" + detail + place
+        case 2: return "Claude needs you" + detail + place
+        case 3: return "Claude is done" + detail + place
         default: return "Claude is napping"
         }
     }
 
+    private func usageText() -> String {
+        let f = fields(pooledUsage())
+        guard f[1] == "1" else { return "Usage: " + (f[4].isEmpty ? "waiting" : f[4]) + (remotes.isEmpty ? "" : " (\(usageSource))") }
+        let meters = f.dropFirst(5).compactMap { m -> String? in
+            let p = m.split(separator: ";").map(String.init)
+            return p.count >= 2 ? "\(p[0].replacingOccurrences(of: "  5h", with: "")) \(p[1])%" : nil
+        }
+        let plan = f[3].isEmpty ? "" : "\(f[3]) · "
+        return meters.joined(separator: "  ·  ") + (remotes.isEmpty && f[3].isEmpty ? "" : "  (\(plan)\(usageSource))")
+    }
+
     func refreshMenu() {
         guard let button = item?.button else { return }
-        let mood = Int(tracker.status().split(separator: "|")[1]) ?? 0
+        let mood = Int(fields(pooledStatus())[1]) ?? 0
         let colors: [NSColor] = [.secondaryLabelColor, NSColor(red: 0.85, green: 0.47, blue: 0.34, alpha: 1), .systemOrange, .systemGreen]
-        let title = NSMutableAttributedString(string: "✻", attributes: [.foregroundColor: link.connected ? colors[mood] : NSColor.tertiaryLabelColor,
-                                                                         .font: NSFont.systemFont(ofSize: 15, weight: .bold)])
-        button.attributedTitle = title
+        button.attributedTitle = NSAttributedString(string: "✻", attributes: [
+            .foregroundColor: link.connected ? colors[min(3, mood)] : NSColor.tertiaryLabelColor,
+            .font: NSFont.systemFont(ofSize: 15, weight: .bold)])
         button.toolTip = "Claude Buddy"
 
         let menu = NSMenu()
-        func info(_ s: String) { let m = NSMenuItem(title: s, action: nil, keyEquivalent: ""); m.isEnabled = false; menu.addItem(m) }
+        func info(_ s: String, to m: NSMenu? = nil) {
+            let i = NSMenuItem(title: s, action: nil, keyEquivalent: "")
+            i.isEnabled = false
+            (m ?? menu).addItem(i)
+        }
+        func action(_ title: String, _ sel: Selector, _ rep: Any? = nil, to m: NSMenu? = nil, key: String = "") -> NSMenuItem {
+            let i = NSMenuItem(title: title, action: sel, keyEquivalent: key)
+            i.target = self
+            i.representedObject = rep
+            (m ?? menu).addItem(i)
+            return i
+        }
+
         info("Device: \(link.status)")
         info(moodText())
-        info(usage.summary)
-        info(today.summary)
+        info(usageText())
+        let t = fields(pooledToday())
+        info("Today: \(t[1]) prompts, \(t[2]) tool calls, \(t[4]) lines")
+        menu.addItem(.separator())
+
+        // Machines
+        info("Machines")
+        let local = fields(tracker.status())
+        let localItem = NSMenuItem(title: "●  This Mac — \(AppDelegate.moodWord(local))", action: nil, keyEquivalent: "")
+        let localSub = NSMenu()
+        info(usage.summary, to: localSub)
         if let why = Hooks.blockedBySettings {
-            info("Limited view: \(why)")
-            info("    (no \"Your turn\" alerts; activity comes from transcripts)")
+            info("Limited view: \(why)", to: localSub)
+            info("(no \"Your turn\" alerts; activity comes from transcripts)", to: localSub)
         } else if tracker.hooklessActive > 0 {
-            info("Restart Claude sessions opened before Claude Buddy for full detail")
+            info("Restart Claude sessions opened before Claude Buddy for full detail", to: localSub)
         }
         if claudeDirs.count > 1 {
-            info("Claude folders: " + claudeDirs.map { $0.path.replacingOccurrences(of: home.path, with: "~") }.joined(separator: ", "))
+            info("Claude folders: " + claudeDirs.map { $0.path.replacingOccurrences(of: home.path, with: "~") }.joined(separator: ", "), to: localSub)
         }
-        menu.addItem(.separator())
-        let hooks = NSMenuItem(title: "Watch Claude Code (hooks)", action: #selector(toggleHooks), keyEquivalent: "")
+        localSub.addItem(.separator())
+        let hooks = action("Watch Claude Code here (hooks)", #selector(toggleHooks), to: localSub)
         hooks.state = Hooks.installed ? .on : .off
-        hooks.target = self
-        menu.addItem(hooks)
-        if #available(macOS 13.0, *) {
-            let login = NSMenuItem(title: "Open at Login", action: #selector(toggleLogin), keyEquivalent: "")
-            login.state = SMAppService.mainApp.status == .enabled ? .on : .off
-            login.target = self
-            menu.addItem(login)
+        localItem.submenu = localSub
+        menu.addItem(localItem)
+
+        for r in remotes {
+            let word = r.connected ? AppDelegate.moodWord(fields(r.status)) : r.state
+            let it = NSMenuItem(title: "\(r.connected ? "●" : "○")  \(r.host) — \(word)", action: nil, keyEquivalent: "")
+            let sub = NSMenu()
+            info(r.connected ? "Connected over SSH" : r.state, to: sub)
+            if !r.account.isEmpty { info("Account: \(r.account)", to: sub) }
+            if let u = r.usage, u.hasPrefix("U|1|") {
+                let meters = fields(u).dropFirst(5).compactMap { m -> String? in
+                    let p = m.split(separator: ";").map(String.init)
+                    return p.count >= 2 ? "\(p[0].replacingOccurrences(of: "  5h", with: "")) \(p[1])%" : nil
+                }
+                info("Usage: " + meters.joined(separator: "  ·  "), to: sub)
+            } else if let u = r.usage {
+                info("Usage: \(fields(u)[4])", to: sub)
+            }
+            if r.hooks.hasPrefix("blocked") { info("Limited view: hooks \(r.hooks) (no \"Your turn\" alerts)", to: sub) }
+            else if r.hooks == "partly" { info("Some sessions there started before Claude Buddy: restart them for full detail", to: sub) }
+            if !r.note.isEmpty { info(r.note, to: sub) }
+            sub.addItem(.separator())
+            _ = action("Reconnect", #selector(reconnectRemote(_:)), r.host, to: sub)
+            _ = action("Remove (and take its hooks out)", #selector(removeRemoteItem(_:)), r.host, to: sub)
+            it.submenu = sub
+            menu.addItem(it)
         }
-        let refresh = NSMenuItem(title: "Refresh Usage Now", action: #selector(refreshUsage), keyEquivalent: "r")
-        refresh.target = self
-        menu.addItem(refresh)
-        let showLog = NSMenuItem(title: "Show Log", action: #selector(openLog), keyEquivalent: "")
-        showLog.target = self
-        menu.addItem(showLog)
+
+        let add = NSMenuItem(title: "Add Remote Machine", action: nil, keyEquivalent: "")
+        let addSub = NSMenu()
+        let known = Set(remotes.map(\.host))
+        let hosts = sshConfigHosts().filter { !known.contains($0) }
+        if hosts.isEmpty { info("No hosts in ~/.ssh/config", to: addSub) }
+        for h in hosts { _ = action(h, #selector(addRemoteItem(_:)), h, to: addSub) }
+        addSub.addItem(.separator())
+        _ = action("Other…", #selector(addOtherRemote), to: addSub)
+        add.submenu = addSub
+        menu.addItem(add)
+
+        menu.addItem(.separator())
+        if #available(macOS 13.0, *) {
+            let login = action("Open at Login", #selector(toggleLogin))
+            login.state = SMAppService.mainApp.status == .enabled ? .on : .off
+        }
+        _ = action("Refresh Usage Now", #selector(refreshUsage), key: "r")
+        _ = action("Show Log", #selector(openLog))
         menu.addItem(.separator())
         menu.addItem(NSMenuItem(title: "Quit Claude Buddy", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q"))
         item.menu = menu
@@ -1076,6 +1475,35 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         do { if Hooks.installed { try Hooks.uninstall() } else { try Hooks.install() } }
         catch { log("hooks: \(error.localizedDescription)") }
         refreshMenu()
+    }
+
+    @objc func addRemoteItem(_ sender: NSMenuItem) {
+        if let h = sender.representedObject as? String { addRemote(h); refreshMenu() }
+    }
+
+    @objc func addOtherRemote() {
+        let alert = NSAlert()
+        alert.messageText = "Add a remote machine"
+        alert.informativeText = "The SSH host where Claude Code runs, as you'd type it after ssh (e.g. devbox or me@10.0.0.5). It needs to log in with a key, without a password prompt."
+        let field = NSTextField(frame: NSRect(x: 0, y: 0, width: 280, height: 24))
+        field.placeholderString = "devbox"
+        alert.accessoryView = field
+        alert.addButton(withTitle: "Add")
+        alert.addButton(withTitle: "Cancel")
+        NSApp.activate(ignoringOtherApps: true)
+        alert.window.initialFirstResponder = field
+        if alert.runModal() == .alertFirstButtonReturn {
+            let h = field.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !h.isEmpty && !h.contains(" ") && !h.contains("'") { addRemote(h); refreshMenu() }
+        }
+    }
+
+    @objc func reconnectRemote(_ sender: NSMenuItem) {
+        if let h = sender.representedObject as? String { remotes.first { $0.host == h }?.reconnect() }
+    }
+
+    @objc func removeRemoteItem(_ sender: NSMenuItem) {
+        if let h = sender.representedObject as? String { removeRemote(h) }
     }
 
     @objc func toggleLogin() {

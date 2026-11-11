@@ -10,6 +10,7 @@ for arch in arm64 x86_64; do
   swiftc -O -swift-version 5 -target "$arch-apple-macos12.0" ClaudeBuddy.swift -o "build/ClaudeBuddy-$arch"
 done
 lipo -create build/ClaudeBuddy-arm64 build/ClaudeBuddy-x86_64 -output "$APP/Contents/MacOS/ClaudeBuddy"
+cp ../remote/buddy-agent.py "$APP/Contents/Resources/"  # sent to remote machines over SSH
 
 cat > "$APP/Contents/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
@@ -20,8 +21,8 @@ cat > "$APP/Contents/Info.plist" <<PLIST
   <key>CFBundleIdentifier</key><string>com.diypet.claudebuddy</string>
   <key>CFBundleExecutable</key><string>ClaudeBuddy</string>
   <key>CFBundlePackageType</key><string>APPL</string>
-  <key>CFBundleShortVersionString</key><string>1.1</string>
-  <key>CFBundleVersion</key><string>2</string>
+  <key>CFBundleShortVersionString</key><string>1.2</string>
+  <key>CFBundleVersion</key><string>3</string>
   <key>LSMinimumSystemVersion</key><string>12.0</string>
   <key>LSUIElement</key><true/>
   <key>NSBluetoothAlwaysUsageDescription</key><string>Claude Buddy talks to your Claude Buddy desk gadget over Bluetooth.</string>

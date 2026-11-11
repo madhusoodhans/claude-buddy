@@ -23,6 +23,13 @@ The device talks to one Mac at a time. To move it to another Mac, quit Claude
 Buddy on the first one (menu ✻ → Quit). The device then shows "Looking for
 your Mac" until the other one connects.
 
+## Claude on a remote machine
+
+If you run Claude Code on a dev box over SSH, add it from the menu: **Add
+Remote Machine**, then pick the host. It needs key-based SSH and `python3`
+there. The **Machines** section lists every machine with what Claude is doing
+on it. See [../remote/README.md](../remote/README.md).
+
 ## Plans and accounts
 
 | Account | Buddy + Today pages | Usage page |

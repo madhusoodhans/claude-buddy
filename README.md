@@ -46,7 +46,10 @@ Macs with macOS 12 or later. Then:
 - **Claude Code** must be installed and signed in on that Mac.
 
 It works with Pro, Max, Team and Enterprise accounts, and API-key setups get
-the Buddy and Today pages. On company Macs where hooks are locked down, it
+the Buddy and Today pages. If Claude runs on a **remote machine** you SSH into
+(VS Code Remote-SSH included), add it from the menu (**Add Remote Machine**).
+The app follows Claude there too and pools every machine. See
+[remote/README.md](remote/README.md). On company Macs where hooks are locked down, it
 falls back to reading transcripts. Details, including what it changes in
 `~/.claude/settings.json`, are in [mac/README.md](mac/README.md). To build it yourself, run `mac/build.sh`. It
 needs only `swiftc`.
@@ -91,6 +94,7 @@ and the card layout were inspired by
 | --- | --- |
 | `buddy/` | Claude Buddy firmware (Arduino sketch, C++). `main.cpp` pages, touch and clock. `face.cpp`, `meters.cpp`, `day.cpp` the three pages |
 | `mac/` | The macOS menu bar app (one Swift file) and its build script |
+| `remote/` | The agent the Mac app runs on remote machines over SSH (Python 3, standard library) |
 | `lib/cheeko_board/` | Board support: display (JD9853), touch, accelerometer, sound, buttons, power |
 | `tools/` | Font generator (`make_fonts.py`), device screenshots (`screenshot.py`), desktop renderer for the screens (`buddy_sim/render.sh`), 3D product shots (`mockups/render.py`) |
 | `cheeko/`, `ios/`, `plan.md` | The earlier firmware: Pip the virtual pet + bike navigation with an iPhone app. Flash it with `./pet.sh flash cheeko` |
