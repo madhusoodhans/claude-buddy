@@ -5,11 +5,13 @@ A little desk companion that gives Claude Code a face. It runs on a
 (an ESP32-S3 handheld with a 240×296 touch screen) and talks over Bluetooth to
 a menu bar app on your Mac.
 
-![All Claude Buddy screens](docs/screenshots/all-states.png)
+![Two Cheeko Gotchis running Claude Buddy: the buddy cooking, and the usage meters](docs/images/hero.jpg)
 
 ## What it shows
 
 Swipe left/right (or press + / −) between three pages. The time is always at the top.
+
+![The three pages: Buddy, Usage, Today](docs/images/pages.png)
 
 1. **The buddy** acts out what Claude Code is doing on the Mac:
    - **Cooking**: chef hat and chopping arms, with what Claude is doing right now ("Editing face.cpp", "Running: build").
@@ -17,10 +19,14 @@ Swipe left/right (or press + / −) between three pages. The time is always at t
    - **All done!**: confetti and a jingle when a turn finishes.
    - **Napping**: nightcap and Zzz while nothing is happening.
    - Tap it to make it giggle, shake the device to make it dizzy, and tilt it to make it look around.
+
+   ![The buddy's moods](docs/images/moods.png)
 2. **Usage**: your plan's 5-hour session and weekly limits, with reset countdowns and a pace marker.
 3. **Today**: lines of code written, files, prompts, tool calls, output tokens, activity by hour, and the latest actions.
 
 Touch and hold anywhere for 1 second to turn sound on or off.
+
+Straight off the real device's screen (`tools/screenshot.py`):
 
 | Live on the device | Waiting for you | Usage and today |
 | --- | --- | --- |
@@ -84,12 +90,18 @@ and the card layout were inspired by
 | `buddy/` | Claude Buddy firmware (Arduino sketch, C++). `main.cpp` pages, touch and clock. `face.cpp`, `meters.cpp`, `day.cpp` the three pages |
 | `mac/` | The macOS menu bar app (one Swift file) and its build script |
 | `lib/cheeko_board/` | Board support: display (JD9853), touch, accelerometer, sound, buttons, power |
-| `tools/` | Font generator (`make_fonts.py`), device screenshots (`screenshot.py`), desktop renderer for the screens (`buddy_sim/render.sh`) |
+| `tools/` | Font generator (`make_fonts.py`), device screenshots (`screenshot.py`), desktop renderer for the screens (`buddy_sim/render.sh`), 3D product shots (`mockups/render.py`) |
 | `cheeko/`, `ios/`, `plan.md` | The earlier firmware: Pip the virtual pet + bike navigation with an iPhone app. Flash it with `./pet.sh flash cheeko` |
 | `MANUAL.md` | Hardware manual for the Cheeko Gotchi (buttons, power, ports, recovery) |
 
 Hardware notes: the middle button is the power key (hold to power off, never
 used by apps). The screen has rounded corners, so UI stays inside
 `board::SAFE_X` near the top and bottom. `PSRAM=opi` is required.
+
+The product images in `docs/images` are rendered, not photographed: run
+`tools/buddy_sim/render.sh`, then `.venv/bin/python tools/mockups/render.py`
+(needs numpy and Pillow). It's a small numpy ray marcher. The case is
+modelled from a photo of the real unit, and the screen pictures come from the
+same drawing code as the firmware.
 
 Font: [Inter](https://rsms.me/inter/) (SIL Open Font License, `tools/fonts/OFL.txt`).
