@@ -1,0 +1,17 @@
+# local tooling and machine-specific files
+.venv/
+__pycache__/
+tools/.cache/
+tools/buddy_sim/out/
+.DS_Store
+
+# factory flash backup of the device (vendor firmware, 16 MB): keep local only
+backup/
+
+# vendor repo, cloned for reference: https://github.com/ALTIO-AI-PRIVATE-LIMITED/cheeko-gotchi
+cheeko-gotchi/
+
+# build output
+ios/CheekoNav/build/
+mac/dist/
+mac/build/
