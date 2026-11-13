@@ -8,7 +8,7 @@ set -euo pipefail
 cd "$(dirname "$0")"
 
 FQBN="esp32:esp32:XIAO_ESP32S3:PSRAM=opi,PartitionScheme=tinyuf2_noota"
-SKETCH="${2:-buddy}"   # the old Pip + Navigation firmware: ./pet.sh flash cheeko
+SKETCH="${2:-buddy}"
 LIBS=(--library lib/cheeko_board)
 
 port() {

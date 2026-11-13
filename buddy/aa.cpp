@@ -186,19 +186,4 @@ void triangle(float x0, float y0, float x1, float y1, float x2, float y2, uint16
   fillTris(v, 1, color);
 }
 
-void chevron(float cx, float cy, float size, float angleDeg, uint16_t color) {
-  // Pointing up before rotation: tip, left wing, notch, right wing.
-  const float pts[4][2] = {{0, -1.15f}, {-0.85f, 0.85f}, {0, 0.38f}, {0.85f, 0.85f}};
-  float a = angleDeg * DEG_TO_RAD, c = cosf(a), s = sinf(a);
-  float p[4][2];
-  for (int i = 0; i < 4; ++i) {
-    float x = pts[i][0] * size, y = pts[i][1] * size;
-    p[i][0] = cx + x * c - y * s;
-    p[i][1] = cy + x * s + y * c;
-  }
-  const float tris[12] = {p[0][0], p[0][1], p[1][0], p[1][1], p[2][0], p[2][1],
-                          p[0][0], p[0][1], p[2][0], p[2][1], p[3][0], p[3][1]};
-  fillTris(tris, 2, color);
-}
-
 }  // namespace aa

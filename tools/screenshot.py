@@ -3,7 +3,7 @@
 
   .venv/bin/python tools/screenshot.py out.png [--port /dev/cu.usbmodem101] [--scale 2]
 
-Needs firmware with the `shot` console command (nav).
+Needs firmware with the `shot` console command (Claude Buddy has it).
 """
 import argparse
 import glob

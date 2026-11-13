@@ -97,8 +97,7 @@ and the card layout were inspired by
 | `remote/` | The agent the Mac app runs on remote machines over SSH (Python 3, standard library) |
 | `lib/cheeko_board/` | Board support: display (JD9853), touch, accelerometer, sound, buttons, power |
 | `tools/` | Font generator (`make_fonts.py`), device screenshots (`screenshot.py`), desktop renderer for the screens (`buddy_sim/render.sh`), 3D product shots (`mockups/render.py`) |
-| `cheeko/`, `ios/`, `plan.md` | The earlier firmware: Pip the virtual pet + bike navigation with an iPhone app. Flash it with `./pet.sh flash cheeko` |
-| `MANUAL.md` | Hardware manual for the Cheeko Gotchi (buttons, power, ports, recovery) |
+| `MANUAL.md` | Device manual: buttons, power, USB ports, the three pages, recovery |
 
 Hardware notes: the middle button is the power key (hold to power off, never
 used by apps). The screen has rounded corners, so UI stays inside

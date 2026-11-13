@@ -12,6 +12,12 @@ backup/
 cheeko-gotchi/
 
 # build output
-ios/CheekoNav/build/
 mac/dist/
 mac/build/
+
+# the earlier Pip + bike-navigation project: kept on this laptop, not part of Claude Buddy
+cheeko/
+ios/
+plan.md
+tools/sim_ride.py
+tools/ble_test.py
