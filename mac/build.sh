@@ -5,7 +5,7 @@
 # (installed apps find it from the menu: Check for Updates).
 set -euo pipefail
 cd "$(dirname "$0")"
-VERSION="${VERSION:-1.3.0}"   # the release tag without the v; the app updates itself from these
+VERSION="${VERSION:-1.3.1}"   # the release tag without the v; the app updates itself from these
 APP="dist/Claude Buddy.app"
 rm -rf dist build && mkdir -p build "$APP/Contents/MacOS" "$APP/Contents/Resources"
 
