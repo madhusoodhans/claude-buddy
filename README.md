@@ -24,7 +24,7 @@ Swipe left/right (or press + / −) between three pages. The time is always at t
 2. **Usage**: your plan's 5-hour session and weekly limits, with reset countdowns and a pace marker. Plans with only a weekly limit show that alone. Spend-capped Enterprise accounts show monthly spend against the cap.
 3. **Today**: lines of code written, files, prompts, tool calls, output tokens, activity by hour, and the latest actions.
 
-Touch and hold anywhere for 1 second to turn sound on or off.
+Touch and hold anywhere for 3 seconds to turn sound on or off.
 
 Straight off the real device's screen (`tools/screenshot.py`):
 

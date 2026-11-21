@@ -861,6 +861,13 @@ final class DeviceLink: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate
         p.delegate = self
         central.connect(p)
         setStatus("Connecting")
+        // CoreBluetooth never times out a connect on its own: if the device restarts or
+        // drops mid-handshake, the app would sit at "Connecting" forever.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 15) { [weak self] in
+            guard let self = self, self.peripheral === p, self.rx == nil else { return }
+            self.central.cancelPeripheralConnection(p)
+            self.lost("Connect timed out, retrying")
+        }
     }
 
     private func lost(_ why: String) {
@@ -871,6 +878,12 @@ final class DeviceLink: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate
     }
 
     func centralManagerDidUpdateState(_ c: CBCentralManager) {
+        if c.state != .poweredOn {
+            // Bluetooth went off (often around sleep): forget the link, or scan() would
+            // skip looking again once it comes back.
+            peripheral = nil
+            rx = nil
+        }
         switch c.state {
         case .poweredOn: scan()
         case .unauthorized: setStatus("Allow Bluetooth in System Settings > Privacy")
@@ -890,10 +903,12 @@ final class DeviceLink: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate
     }
 
     func centralManager(_ c: CBCentralManager, didFailToConnect p: CBPeripheral, error: Error?) {
+        guard p === peripheral else { return }  // a stale attempt we already gave up on
         lost("Couldn't connect, retrying")
     }
 
     func centralManager(_ c: CBCentralManager, didDisconnectPeripheral p: CBPeripheral, error: Error?) {
+        guard p === peripheral else { return }
         lost("Disconnected, looking again")
     }
 

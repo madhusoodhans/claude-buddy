@@ -54,6 +54,9 @@ constexpr uint16_t rgb(uint8_t r, uint8_t g, uint8_t b) {
 bool begin();
 
 // ---- Display ----
+// Shows the screen rotated 180° (ports at the bottom, as in the dock), with
+// touch and motion turned to match. Drawing code is unaffected. Default true.
+extern bool flipped;
 extern GFXcanvas16* fb;  // full-screen framebuffer (PSRAM); draw here, then lcdPush()
 void lcdPush();
 // Hands the finished frame to a background task and switches `fb` to a second

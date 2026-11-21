@@ -13,6 +13,7 @@ static constexpr uint8_t LIS2DH12_ADDR = 0x19;
 GFXcanvas16* fb = nullptr;
 bool accelOk = false;
 bool audioOk = false;
+bool flipped = true;
 
 // ============================================================================
 // Display
@@ -111,7 +112,19 @@ static void sendFrame(const uint16_t* pixels) {
   lcdSetWindow(0, 0, LCD_W - 1, LCD_H - 1);
   digitalWrite(PIN_LCD_DC, HIGH);
   digitalWrite(PIN_LCD_CS, LOW);
-  SPI.writePixels(pixels, LCD_W * LCD_H * 2);  // swaps to big-endian
+  if (!flipped) {
+    SPI.writePixels(pixels, LCD_W * LCD_H * 2);  // swaps to big-endian
+  } else {
+    // Rotated 180°: send the pixels last to first. Done in software because a
+    // MADCTL flip mirrors within the controller's full memory, not this panel.
+    static uint16_t chunk[LCD_W * 8];
+    const int n = LCD_W * LCD_H;
+    for (int end = n; end > 0; end -= LCD_W * 8) {
+      int count = min(end, LCD_W * 8);
+      for (int i = 0; i < count; ++i) chunk[i] = pixels[end - 1 - i];
+      SPI.writePixels(chunk, count * 2);
+    }
+  }
   digitalWrite(PIN_LCD_CS, HIGH);
 }
 
@@ -186,6 +199,10 @@ bool touchRead(int& x, int& y) {
   // Touch panel is rotated 90° vs the display (SKILL.md, Gotcha 3).
   x = constrain((rawY - 12) * 180 / 211 + 30, 0, LCD_W - 1);
   y = constrain((260 - rawX) * 216 / 222 + 40, 0, LCD_H - 1);
+  if (flipped) {
+    x = LCD_W - 1 - x;
+    y = LCD_H - 1 - y;
+  }
   return true;
 }
 
@@ -204,6 +221,10 @@ bool accelRead(int16_t& x, int16_t& y, int16_t& z) {
   x = (int16_t)((raw[1] << 8) | raw[0]) >> 4;
   y = (int16_t)((raw[3] << 8) | raw[2]) >> 4;
   z = (int16_t)((raw[5] << 8) | raw[4]) >> 4;
+  if (flipped) {
+    x = -x;
+    y = -y;
+  }
   return true;
 }
 

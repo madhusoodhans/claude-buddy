@@ -6,11 +6,11 @@
 //   3. Claude's day: lines, prompts, tools, activity   day.cpp
 // The time runs along the top of every page.
 //
-// Touch and hold anywhere (1s) toggles sound. Tap the buddy, shake the device.
+// Touch and hold anywhere (3s) toggles sound. Tap the buddy, shake the device.
 // The middle button is the hardware power key (hold to power off).
 //
 // Messages (PROTOCOL.md) arrive over Bluetooth from the Mac helper, or as
-// lines on the USB console. Console also: page N, demo, shot, sound, status.
+// lines on the USB console. Console also: page N, demo, shot, sound, flip, status.
 //
 // Hardware access lives in ../lib/cheeko_board. Build with ../pet.sh.
 
@@ -161,7 +161,12 @@ static void pollTouch(uint32_t now) {
       swiped = true;
       goTo(page + (dx < 0 ? 1 : -1), dx < 0 ? 1 : -1, now);
     }
-    if (!swiped && !held && now - touchAt > 1000 && abs(dx) < 14 && abs(dy) < 14) {
+    // Sound toggles only after a deliberate 3s hold, with a warning after 1s, so a
+    // thumb resting on the glass while handling the device can't flip it silently.
+    bool still = abs(dx) < 14 && abs(dy) < 14;
+    if (!swiped && !held && still && now - touchAt > 1000 && now - touchAt < 3000)
+      showToast(soundOn ? "Hold to mute" : "Hold for sound", 300);
+    if (!swiped && !held && still && now - touchAt > 3000) {
       held = true;
       soundOn = !soundOn;
       settings.putBool("sound", soundOn);
@@ -233,12 +238,19 @@ static void handleLine(const char* line) {
     demo = false;
   } else if (!strcmp(line, "sound")) {
     soundOn = !soundOn;
+    settings.putBool("sound", soundOn);
     Serial.printf("sound %s\n", soundOn ? "on" : "off");
+    if (soundOn) sfx({{988, 60}, {1319, 80}});
+  } else if (!strcmp(line, "flip")) {
+    board::flipped = !board::flipped;
+    settings.putBool("flipped", board::flipped);
+    Serial.printf("screen %s\n", board::flipped ? "rotated 180" : "normal");
   } else if (!strcmp(line, "status")) {
     Serial.printf("page=%d ble=%d mood=%d detail='%s' usage=%d/%d meters=%d", page + 1, bt::connected(),
                   (int)activity.mood, activity.detail, usage.known, usage.ok, usage.count);
     for (int i = 0; i < usage.count; ++i) Serial.printf(" [%s %d%%]", usage.meters[i].label, usage.meters[i].pct);
-    Serial.printf(" clock=%d host='%s'\n", clockKnown(), hostName);
+    Serial.printf(" clock=%d host='%s' sound=%d audio=%d flipped=%d\n", clockKnown(), hostName, soundOn,
+                  board::audioOk, board::flipped);
   } else if (!strcmp(line, "shot")) {
     // Raw RGB565, little-endian, row by row (tools/screenshot.py).
     uint32_t now = millis();
@@ -249,7 +261,7 @@ static void handleLine(const char* line) {
     Serial.write((const uint8_t*)fb->getBuffer(), bytes);
     Serial.println();
   } else {
-    Serial.println("commands: page 1|2|3, demo, demo off, sound, status, shot, or a protocol line (PROTOCOL.md)");
+    Serial.println("commands: page 1|2|3, demo, demo off, sound, flip, status, shot, or a protocol line (PROTOCOL.md)");
   }
 }
 
@@ -302,6 +314,7 @@ void setup() {
   settings.begin("buddy", false);
   page = constrain(settings.getUChar("page", 0), 0, PAGES - 1);
   soundOn = settings.getBool("sound", true);
+  board::flipped = settings.getBool("flipped", true);
   Serial.println("claude buddy booted");
   if (soundOn) sfx({{523, 70}, {784, 70}, {1047, 120}});
 }
